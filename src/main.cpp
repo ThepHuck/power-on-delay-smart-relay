@@ -2,10 +2,22 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <EEPROM.h>
+#include <bearssl/bearssl_hmac.h>
 
 // --- UPDATE THESE WITH YOUR WI-FI DETAILS ---
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
+
+// Web login credentials (separate from the Wi-Fi password).
+const char WEB_USERNAME[] = "admin";
+// Set this before compiling. A password saved through Config overrides it.
+const char DEFAULT_WEB_PASSWORD[] = "ChangeMe123!";
+static_assert(sizeof(DEFAULT_WEB_PASSWORD) >= 9 && sizeof(DEFAULT_WEB_PASSWORD) <= 129,
+              "Web password must be 8-128 bytes");
+const size_t MAX_WEB_PASSWORD_LENGTH = 128;
+const unsigned long SESSION_LIFETIME = 3600000UL; // One hour; reboots end all sessions.
+const unsigned long LOGIN_RETRY_DELAY = 1000UL;
+const uint32_t PASSWORD_HASH_ITERATIONS = 10000;
 
 // This working relay board is active LOW on GPIO0.
 const int RELAY_PIN = 0;
@@ -29,16 +41,87 @@ ESP8266WebServer server(80);
 
 const size_t MAX_DISPLAY_NAME_LENGTH = 64;
 const size_t MAX_MDNS_NAME_LENGTH = 63;
-const uint32_t SETTINGS_MAGIC = 0x524C5901; // RLY, settings format version 1.
-struct DeviceSettings {
+const uint32_t LEGACY_SETTINGS_MAGIC = 0x524C5901;
+const uint32_t SETTINGS_MAGIC = 0x524C5902; // Version 2 adds a password override.
+struct LegacyDeviceSettings {
   uint32_t magic;
   uint32_t checksum;
   char displayName[MAX_DISPLAY_NAME_LENGTH + 1];
   char mdnsName[MAX_MDNS_NAME_LENGTH + 1];
 };
+struct PasswordCredentials {
+  uint8_t salt[16];
+  uint8_t hash[32];
+};
+struct DeviceSettings {
+  uint32_t magic;
+  uint32_t checksum;
+  char displayName[MAX_DISPLAY_NAME_LENGTH + 1];
+  char mdnsName[MAX_MDNS_NAME_LENGTH + 1];
+  uint8_t hasPasswordOverride;
+  PasswordCredentials credentials;
+};
 String displayName = "ESP-01S Relay Controller";
 String mdnsName = "esp-relay";
 bool settingsPersisted = false;
+bool hasPasswordOverride = false;
+PasswordCredentials passwordCredentials = {};
+
+struct WebSession {
+  char token[33];
+  char csrf[33];
+  unsigned long startedAt;
+};
+WebSession sessions[4] = {};
+WebSession* requestSession = nullptr;
+bool loginAttemptMade = false;
+unsigned long lastLoginAttempt = 0;
+
+void updateTimer();
+
+bool constantTimeEqual(const uint8_t* first, const uint8_t* second, size_t length) {
+  uint8_t difference = 0;
+  for (size_t i = 0; i < length; ++i) difference |= first[i] ^ second[i];
+  return difference == 0;
+}
+
+bool secretEquals(const String& first, const String& second) {
+  if (first.length() != second.length()) return false;
+  return constantTimeEqual(reinterpret_cast<const uint8_t*>(first.c_str()),
+                           reinterpret_cast<const uint8_t*>(second.c_str()), first.length());
+}
+
+void derivePasswordHash(const String& candidate, const uint8_t* salt, uint8_t* output) {
+  // PBKDF2-HMAC-SHA256, one 32-byte output block. BearSSL provides HMAC.
+  br_hmac_key_context key;
+  br_hmac_key_init(&key, &br_sha256_vtable, candidate.c_str(), candidate.length());
+  br_hmac_context context;
+  const uint8_t blockIndex[] = {0, 0, 0, 1};
+  uint8_t previous[32];
+  br_hmac_init(&context, &key, 32);
+  br_hmac_update(&context, salt, 16);
+  br_hmac_update(&context, blockIndex, sizeof(blockIndex));
+  br_hmac_out(&context, previous);
+  memcpy(output, previous, sizeof(previous));
+  for (uint32_t iteration = 1; iteration < PASSWORD_HASH_ITERATIONS; ++iteration) {
+    br_hmac_init(&context, &key, 32);
+    br_hmac_update(&context, previous, sizeof(previous));
+    br_hmac_out(&context, previous);
+    for (size_t i = 0; i < sizeof(previous); ++i) output[i] ^= previous[i];
+    if (iteration % 32 == 0) {
+      updateTimer(); // Keep relay timing and the watchdog working during hashing.
+      yield();
+    }
+  }
+}
+
+bool verifyWebPassword(const String& candidate) {
+  if (candidate.length() == 0 || candidate.length() > MAX_WEB_PASSWORD_LENGTH) return false;
+  if (!hasPasswordOverride) return secretEquals(candidate, String(DEFAULT_WEB_PASSWORD));
+  uint8_t hash[32];
+  derivePasswordHash(candidate, passwordCredentials.salt, hash);
+  return constantTimeEqual(hash, passwordCredentials.hash, sizeof(hash));
+}
 
 bool validDisplayName(const String& name) {
   if (name.length() == 0 || name.length() > MAX_DISPLAY_NAME_LENGTH) return false;
@@ -59,7 +142,8 @@ bool validMdnsName(const String& name) {
   return true;
 }
 
-uint32_t settingsChecksum(const DeviceSettings& settings) {
+template <typename T>
+uint32_t namesChecksum(const T& settings) {
   // FNV-1a detects incomplete/corrupt stored names; do not hash struct padding.
   uint32_t hash = 2166136261UL;
   for (char c : settings.displayName) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
@@ -67,34 +151,64 @@ uint32_t settingsChecksum(const DeviceSettings& settings) {
   return hash;
 }
 
+uint32_t settingsChecksum(const DeviceSettings& settings) {
+  uint32_t hash = namesChecksum(settings);
+  hash = (hash ^ settings.hasPasswordOverride) * 16777619UL;
+  for (uint8_t c : settings.credentials.salt) hash = (hash ^ c) * 16777619UL;
+  for (uint8_t c : settings.credentials.hash) hash = (hash ^ c) * 16777619UL;
+  return hash;
+}
+
+template <typename T>
+bool validStoredNames(const T& saved) {
+  return memchr(saved.displayName, '\0', sizeof(saved.displayName)) &&
+    memchr(saved.mdnsName, '\0', sizeof(saved.mdnsName)) &&
+    validDisplayName(String(saved.displayName)) && validMdnsName(String(saved.mdnsName));
+}
+
 void loadSettings() {
   EEPROM.begin(sizeof(DeviceSettings));
   DeviceSettings saved = {};
   EEPROM.get(0, saved);
-  if (saved.magic != SETTINGS_MAGIC || saved.checksum != settingsChecksum(saved) ||
-      !memchr(saved.displayName, '\0', sizeof(saved.displayName)) ||
-      !memchr(saved.mdnsName, '\0', sizeof(saved.mdnsName)) ||
-      !validDisplayName(String(saved.displayName)) || !validMdnsName(String(saved.mdnsName))) {
-    Serial.println("No valid saved configuration. Using default names.");
-    return;
+  if (saved.magic == SETTINGS_MAGIC && saved.checksum == settingsChecksum(saved) &&
+      saved.hasPasswordOverride <= 1 && validStoredNames(saved)) {
+    displayName = saved.displayName;
+    mdnsName = saved.mdnsName;
+    hasPasswordOverride = saved.hasPasswordOverride != 0;
+    passwordCredentials = saved.credentials;
+    settingsPersisted = true;
+  } else {
+    // Keep names saved by the previous firmware; use the compiled login password.
+    LegacyDeviceSettings legacy = {};
+    EEPROM.get(0, legacy);
+    if (legacy.magic == LEGACY_SETTINGS_MAGIC && legacy.checksum == namesChecksum(legacy) &&
+        validStoredNames(legacy)) {
+      displayName = legacy.displayName;
+      mdnsName = legacy.mdnsName;
+      Serial.println("Loaded previous configuration. Password uses compiled default.");
+    } else {
+      Serial.println("No valid saved configuration. Using defaults.");
+    }
   }
-  displayName = saved.displayName;
-  mdnsName = saved.mdnsName;
-  settingsPersisted = true;
 }
 
-bool saveSettings(const String& newDisplayName, const String& newMdnsName) {
+bool saveSettings(const String& newDisplayName, const String& newMdnsName,
+                  const PasswordCredentials* newCredentials = nullptr) {
   // Write only on a changed Save, never during polling or at each boot.
-  if (settingsPersisted && newDisplayName == displayName && newMdnsName == mdnsName) return true;
+  if (!newCredentials && settingsPersisted && newDisplayName == displayName && newMdnsName == mdnsName) return true;
   DeviceSettings saved = {};
   saved.magic = SETTINGS_MAGIC;
   newDisplayName.toCharArray(saved.displayName, sizeof(saved.displayName));
   newMdnsName.toCharArray(saved.mdnsName, sizeof(saved.mdnsName));
+  saved.hasPasswordOverride = newCredentials || hasPasswordOverride;
+  saved.credentials = newCredentials ? *newCredentials : passwordCredentials;
   saved.checksum = settingsChecksum(saved);
   EEPROM.put(0, saved);
   if (!EEPROM.commit()) return false;
   displayName = newDisplayName;
   mdnsName = newMdnsName;
+  hasPasswordOverride = saved.hasPasswordOverride != 0;
+  passwordCredentials = saved.credentials;
   settingsPersisted = true;
   return true;
 }
@@ -113,6 +227,152 @@ String escapeHtml(const String& value) {
     }
   }
   return escaped;
+}
+
+void sendPrivateHeaders() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Frame-Options", "DENY");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+}
+
+void redirectTo(const String& location) {
+  sendPrivateHeaders();
+  server.sendHeader("Location", location, true);
+  server.send(303, "text/plain", "");
+}
+
+String getLoginHTML(const String& message = "") {
+  String html = F(R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Relay login</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 50px auto; padding: 0 16px; max-width: 360px; background: #f4f4f4; }
+label { display: block; margin-top: 20px; } input { box-sizing: border-box; width: 100%; padding: 12px; margin-top: 8px; font-size: 18px; }
+button { margin-top: 24px; padding: 12px 24px; font-size: 18px; color: white; background: #1976d2; border: none; border-radius: 8px; cursor: pointer; }
+</style></head><body><h2>Relay login</h2>)HTML");
+  if (message.length()) {
+    html += F("<p role=\"alert\">");
+    html += escapeHtml(message);
+    html += F("</p>");
+  }
+  html += F(R"HTML(<form action="/login" method="post">
+<label for="username">Username</label><input id="username" name="username" type="text" value="admin" autocomplete="username" required>
+<label for="password">Password</label><input id="password" name="password" type="password" maxlength="128" autocomplete="current-password" required>
+<button type="submit">Sign in</button></form></body></html>)HTML");
+  return html;
+}
+
+String sessionCookie() {
+  // Parse a complete cookie name/value, rather than accepting substring matches.
+  const String cookie = server.header("Cookie");
+  unsigned int start = 0;
+  while (start < cookie.length()) {
+    const int delimiter = cookie.indexOf(';', start);
+    const unsigned int end = delimiter < 0 ? cookie.length() : static_cast<unsigned int>(delimiter);
+    String part = cookie.substring(start, end);
+    part.trim();
+    if (part.startsWith("ESPSESSIONID=")) return part.substring(13);
+    start = end + 1;
+  }
+  return "";
+}
+
+WebSession* authenticatedSession() {
+  const String token = sessionCookie();
+  if (token.length() != 32) return nullptr;
+  const unsigned long now = millis();
+  for (WebSession& session : sessions) {
+    if (session.token[0] && now - session.startedAt >= SESSION_LIFETIME) session.token[0] = '\0';
+    if (session.token[0] && secretEquals(token, String(session.token))) return &session;
+  }
+  return nullptr;
+}
+
+void randomToken(char* output) {
+  uint8_t randomBytes[16];
+  ESP.random(randomBytes, sizeof(randomBytes));
+  const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < sizeof(randomBytes); ++i) {
+    output[2 * i] = hex[randomBytes[i] >> 4];
+    output[2 * i + 1] = hex[randomBytes[i] & 15];
+  }
+  output[32] = '\0';
+}
+
+void clearSessionCookie() {
+  server.sendHeader("Set-Cookie", "ESPSESSIONID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+}
+
+void handleLogin() {
+  sendPrivateHeaders();
+  if (server.method() == HTTP_GET) {
+    if (authenticatedSession()) {
+      redirectTo("/");
+      return;
+    }
+    server.send(200, "text/html; charset=utf-8", getLoginHTML());
+    return;
+  }
+  const unsigned long now = millis();
+  if (loginAttemptMade && now - lastLoginAttempt < LOGIN_RETRY_DELAY) {
+    server.sendHeader("Retry-After", "1");
+    server.send(429, "text/html; charset=utf-8", getLoginHTML("Please wait a second before trying again."));
+    return;
+  }
+  loginAttemptMade = true;
+  lastLoginAttempt = now;
+  if (server.arg("username") != WEB_USERNAME || !verifyWebPassword(server.arg("password"))) {
+    server.send(401, "text/html; charset=utf-8", getLoginHTML("Incorrect username or password."));
+    return;
+  }
+  WebSession* selected = &sessions[0];
+  for (WebSession& session : sessions) {
+    if (!session.token[0] || now - session.startedAt >= SESSION_LIFETIME) {
+      selected = &session;
+      break;
+    }
+    if (now - session.startedAt > now - selected->startedAt) selected = &session;
+  }
+  randomToken(selected->token);
+  randomToken(selected->csrf);
+  selected->startedAt = millis();
+  String cookie = F("ESPSESSIONID=");
+  cookie += selected->token;
+  cookie += F("; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600");
+  server.sendHeader("Set-Cookie", cookie);
+  redirectTo("/");
+}
+
+String csrfInput() {
+  String html = F("<input type=\"hidden\" name=\"csrf\" value=\"");
+  html += requestSession->csrf;
+  html += F("\">");
+  return html;
+}
+
+void addProtectedRoute(const char* uri, HTTPMethod method, std::function<void()> handler) {
+  server.on(uri, method, [method, handler]() {
+    sendPrivateHeaders();
+    WebSession* session = authenticatedSession();
+    if (!session) {
+      clearSessionCookie();
+      if (method == HTTP_GET && server.uri() != "/status") redirectTo("/login");
+      else server.send(401, "text/plain", "Authentication required.");
+      return;
+    }
+    if (method == HTTP_POST && !secretEquals(server.arg("csrf"), String(session->csrf))) {
+      server.send(403, "text/plain", "Session validation failed. Reload the page and try again.");
+      return;
+    }
+    requestSession = session;
+    handler();
+    requestSession = nullptr;
+  });
+}
+
+void handleLogout() {
+  requestSession->token[0] = '\0';
+  clearSessionCookie();
+  redirectTo("/login");
 }
 
 void restartMdns() {
@@ -185,10 +445,12 @@ form { margin: 24px 0; } #error { color: #b71c1c; }
 <p>Start turns the relay OFF, then ON when the timer finishes.<br>
 Starting again replaces the timer. Manual toggling cancels it.</p>
 <p><a class="config-button" href="/config">Config</a></p>
+<form action="/logout" method="post" id="logoutForm"><button type="submit">Sign out</button></form>
 <p id="error" role="alert"></p>
 <script>
 async function refreshStatus() {
   const response = await fetch('/status', {cache: 'no-store'});
+  if (response.status === 401) { location.replace('/login'); throw new Error('Please sign in again.'); }
   if (!response.ok) throw new Error('Could not read relay status.');
   const state = await response.json();
   document.getElementById('relay').textContent = state.on ? 'ON' : 'OFF';
@@ -218,6 +480,7 @@ for (const id of ['toggleForm', 'timerForm']) {
       const response = await fetch(form.action, {
         method: 'POST', body: new URLSearchParams(new FormData(form))
       });
+      if (response.status === 401) { location.replace('/login'); throw new Error('Please sign in again.'); }
       if (!response.ok) throw new Error(await response.text());
       await refreshStatus();
       document.getElementById('error').textContent = '';
@@ -230,6 +493,10 @@ for (const id of ['toggleForm', 'timerForm']) {
 }
 pollStatus();
 </script></body></html>)HTML");
+  html.replace("<button id=\"toggle\"", csrfInput() + "<button id=\"toggle\"");
+  html.replace("<label for=\"seconds\">", csrfInput() + "<label for=\"seconds\">");
+  html.replace("<form action=\"/logout\" method=\"post\" id=\"logoutForm\">",
+               String(F("<form action=\"/logout\" method=\"post\" id=\"logoutForm\">")) + csrfInput());
   return html;
 }
 
@@ -252,15 +519,27 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
     html += escapeHtml(message);
     html += F("</p>");
   }
-  html += F("<form action=\"/config\" method=\"post\"><label for=\"displayName\">WebUI display name</label><input id=\"displayName\" name=\"displayName\" type=\"text\" maxlength=\"64\" required value=\"");
+  html += F("<form action=\"/config\" method=\"post\">");
+  html += csrfInput();
+  html += F("<label for=\"displayName\">WebUI display name</label><input id=\"displayName\" name=\"displayName\" type=\"text\" maxlength=\"64\" required value=\"");
   html += escapeHtml(formDisplayName);
   html += F("\"><p class=\"help\">Up to 64 bytes; spaces are allowed.</p><label for=\"mdnsName\">mDNS hostname</label><input id=\"mdnsName\" name=\"mdnsName\" type=\"text\" maxlength=\"63\" pattern=\"[A-Za-z0-9]([A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?\" autocapitalize=\"none\" spellcheck=\"false\" required value=\"");
   html += escapeHtml(formMdnsName);
-  html += F("\"><p class=\"help\">Use letters, digits and hyphens. Enter only the hostname, without .local; for example, garage-relay. Choose a unique name on your network.</p><button type=\"submit\">Save</button></form><p>Settings are retained after reboot or power loss.</p><p>Device address: <a href=\"http://");
+  html += F("\"><p class=\"help\">Use letters, digits and hyphens. Enter only the hostname, without .local; for example, garage-relay. Choose a unique name on your network.</p><button type=\"submit\">Save</button></form><p>Settings are retained after reboot or power loss.</p>");
+  html += F("<h3>Change admin password</h3><form action=\"/password\" method=\"post\">");
+  html += csrfInput();
+  html += F(R"HTML(<label for="currentPassword">Current password</label>
+<input id="currentPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required>
+<label for="newPassword">New password</label>
+<input id="newPassword" name="newPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+<label for="confirmPassword">Confirm new password</label>
+<input id="confirmPassword" name="confirmPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+<p class="help">Use 8-128 bytes. Changing the password signs out all sessions.</p>
+<button type="submit">Update password</button></form><p>Device address: <a href="http://)HTML");
   html += mdnsName;
   html += F(".local/\">http://");
   html += mdnsName;
-  html += F(".local/</a></p><p class=\"help\">After changing the hostname, open the new address above. It may take a moment to become available.</p><p><a class=\"back\" href=\"http://");
+  html += F(".local/</a></p><p class=\"help\">After changing the hostname, open the new address above. It may take a moment to become available. Opening a different address may require signing in again.</p><p><a class=\"back\" href=\"http://");
   // The IP link remains usable even when the page was opened through the old hostname.
   html += WiFi.localIP().toString();
   html += F("/\">Back to relay</a></p></body></html>");
@@ -298,9 +577,45 @@ void handleSaveConfig() {
   server.send(200, "text/html; charset=utf-8", getConfigHTML(message, false, displayName, mdnsName));
 }
 
+void handleChangePassword() {
+  const String currentPassword = server.arg("currentPassword");
+  const String newPassword = server.arg("newPassword");
+  const String confirmation = server.arg("confirmPassword");
+  if (newPassword.length() < 8 || newPassword.length() > MAX_WEB_PASSWORD_LENGTH ||
+      !secretEquals(newPassword, confirmation)) {
+    server.send(400, "text/html; charset=utf-8", getConfigHTML(
+      "The new password must contain 8-128 bytes and match its confirmation.", true, displayName, mdnsName));
+    return;
+  }
+  const unsigned long now = millis();
+  if (loginAttemptMade && now - lastLoginAttempt < LOGIN_RETRY_DELAY) {
+    server.sendHeader("Retry-After", "1");
+    server.send(429, "text/html; charset=utf-8", getConfigHTML(
+      "Please wait a second before trying again.", true, displayName, mdnsName));
+    return;
+  }
+  loginAttemptMade = true;
+  lastLoginAttempt = now;
+  if (!verifyWebPassword(currentPassword)) {
+    server.send(403, "text/html; charset=utf-8", getConfigHTML(
+      "The current password is incorrect.", true, displayName, mdnsName));
+    return;
+  }
+  PasswordCredentials updated = {};
+  ESP.random(updated.salt, sizeof(updated.salt));
+  derivePasswordHash(newPassword, updated.salt, updated.hash);
+  if (!saveSettings(displayName, mdnsName, &updated)) {
+    server.send(500, "text/html; charset=utf-8", getConfigHTML(
+      "Could not save the password to flash. Please try again.", true, displayName, mdnsName));
+    return;
+  }
+  for (WebSession& session : sessions) session.token[0] = '\0';
+  clearSessionCookie();
+  server.send(200, "text/html; charset=utf-8", getLoginHTML("Password updated. Sign in with your new password."));
+}
+
 void redirectHome() {
-  server.sendHeader("Location", "/", true);
-  server.send(303, "text/plain", "");
+  redirectTo("/");
 }
 
 void handleToggle() {
@@ -390,15 +705,21 @@ void setup() {
   Serial.println("\nStarting up...");
   loadSettings();
 
-  server.on("/", HTTP_GET, []() {
+  server.collectHeaders("Cookie");
+  server.on("/login", HTTP_GET, handleLogin);
+  server.on("/login", HTTP_POST, handleLogin);
+  addProtectedRoute("/", HTTP_GET, []() {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", getHTML());
   });
-  server.on("/config", HTTP_GET, handleConfig);
-  server.on("/config", HTTP_POST, handleSaveConfig);
-  server.on("/toggle", HTTP_POST, handleToggle);
-  server.on("/timer", HTTP_POST, handleStartTimer);
-  server.on("/status", HTTP_GET, handleStatus);
+  addProtectedRoute("/config", HTTP_GET, handleConfig);
+  addProtectedRoute("/config", HTTP_POST, handleSaveConfig);
+  addProtectedRoute("/password", HTTP_POST, handleChangePassword);
+  addProtectedRoute("/logout", HTTP_POST, handleLogout);
+  addProtectedRoute("/toggle", HTTP_POST, handleToggle);
+  addProtectedRoute("/timer", HTTP_POST, handleStartTimer);
+  addProtectedRoute("/status", HTTP_GET, handleStatus);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found."); });
   server.begin();
 
   WiFi.mode(WIFI_STA);
