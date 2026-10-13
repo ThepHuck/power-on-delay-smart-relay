@@ -6,150 +6,231 @@
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
 
-// Most standard ESP-01S Relay modules use GPIO 0 to trigger the relay.
-// If yours uses a different pin, change this to 2.
-const int RELAY_PIN = 0; 
+// This working relay board is active LOW on GPIO0.
+const int RELAY_PIN = 0;
+// ESP-01S onboard LED: GPIO2, active LOW (do not use the relay pin).
+const int STATUS_LED_PIN = 2;
+static_assert(RELAY_PIN != STATUS_LED_PIN, "Relay and LED need separate pins");
+const unsigned long AUTO_TURN_ON_DELAY = 60000UL;
+const unsigned long LED_BLINK_INTERVAL = 1000UL;
+const unsigned long MAX_TIMER_SECONDS = 4294967UL; // Fits in 32-bit milliseconds.
 
-// Track the current state of the relay (false = off, true = on)
-bool relayState = false; 
+bool relayState = false;
+bool timerActive = true;
+unsigned long timerStartedAt = 0; // Startup countdown begins at boot.
+unsigned long timerDuration = AUTO_TURN_ON_DELAY;
+bool ledOn = true;
+unsigned long lastLedChange = 0;
+bool wifiWasConnected = false;
+bool mdnsStarted = false;
 
-// Track if the automatic turn-on has happened
-bool autoTurnedOn = false;
-const unsigned long AUTO_TURN_ON_DELAY = 60000; // 60 seconds in milliseconds
-
-// Create a web server listening on standard HTTP port 80
 ESP8266WebServer server(80);
 
-// Function to build the HTML page
+void setRelay(bool on) {
+  relayState = on;
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  Serial.println(on ? "Relay: ON" : "Relay: OFF");
+}
+
+void updateTimer() {
+  // Unsigned subtraction also works when millis() wraps around.
+  if (timerActive && millis() - timerStartedAt >= timerDuration) {
+    timerActive = false;
+    setRelay(true);
+    Serial.println("Relay timer completed.");
+  }
+}
+
+unsigned long secondsRemaining() {
+  if (!timerActive) return 0;
+  const unsigned long elapsed = millis() - timerStartedAt;
+  if (elapsed >= timerDuration) return 0;
+  const unsigned long remaining = timerDuration - elapsed;
+  return remaining / 1000UL + (remaining % 1000UL != 0);
+}
+
 String getHTML() {
-  String html;
-  html.reserve(1500); // Increased memory allocation to accommodate JavaScript
-  html = "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-  
-  // Basic CSS to make it look decent on a phone or desktop
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f4; }";
-  html += ".btn { display: inline-block; padding: 20px 40px; font-size: 24px; cursor: pointer; text-decoration: none; color: white; border-radius: 8px; border: none; transition: 0.3s; }";
-  html += ".btn-on { background-color: #f44336; }"; // Red button when ON (to turn it off)
-  html += ".btn-off { background-color: #4CAF50; }"; // Green button when OFF (to turn it on)
-  html += "</style></head><body>";
-  
-  html += "<h2>ESP-01S Relay Controller</h2>";
-
-  // Calculate remaining time for the auto-turn-on feature
-  long secondsLeft = 0;
-  if (!autoTurnedOn && millis() < AUTO_TURN_ON_DELAY) {
-    secondsLeft = (AUTO_TURN_ON_DELAY - millis()) / 1000;
+  return F(R"HTML(<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP-01S Relay Controller</title>
+<style>
+body { font-family: Arial, sans-serif; text-align: center; margin: 50px 16px; background: #f4f4f4; }
+button { padding: 16px 28px; font-size: 20px; cursor: pointer; color: white; border-radius: 8px; border: none; background: #1976d2; }
+.btn-on { background: #f44336; } .btn-off { background: #4caf50; }
+input { padding: 12px; font-size: 20px; width: 160px; }
+form { margin: 24px 0; } #error { color: #b71c1c; }
+</style></head><body>
+<h2>ESP-01S Relay Controller</h2>
+<p>Relay is currently: <strong id="relay">Loading...</strong></p>
+<form action="/toggle" method="post" id="toggleForm">
+<button id="toggle" disabled>Loading...</button>
+</form>
+<p id="timerText" aria-live="polite">Loading timer...</p>
+<form action="/timer" method="post" id="timerForm">
+<label for="seconds">Timer duration (seconds)</label><br><br>
+<input id="seconds" name="seconds" type="number" min="1" max="4294967" step="1" value="60" required>
+<button type="submit">Start</button>
+</form>
+<p>Start turns the relay OFF, then ON when the timer finishes.<br>
+Starting again replaces the timer. Manual toggling cancels it.</p>
+<p id="error" role="alert"></p>
+<script>
+async function refreshStatus() {
+  const response = await fetch('/status', {cache: 'no-store'});
+  if (!response.ok) throw new Error('Could not read relay status.');
+  const state = await response.json();
+  document.getElementById('relay').textContent = state.on ? 'ON' : 'OFF';
+  const toggle = document.getElementById('toggle');
+  toggle.disabled = false;
+  toggle.textContent = state.on ? 'Turn OFF' : 'Turn ON';
+  toggle.className = state.on ? 'btn-on' : 'btn-off';
+  document.getElementById('timerText').textContent = state.active
+    ? 'Turning ON in: ' + state.remaining + ' seconds' : 'No timer running.';
+}
+async function pollStatus() {
+  try {
+    await refreshStatus();
+    document.getElementById('error').textContent = '';
+  } catch (error) {
+    document.getElementById('error').textContent = 'Connection lost. Retrying...';
   }
-  
-  // If the timer is still running, display it and add JavaScript to count down
-  if (secondsLeft > 0) {
-    html += "<p id=\"timerText\">Auto-powering on in: <strong id=\"timer\">" + String(secondsLeft) + "</strong> seconds</p>";
-    html += "<script>";
-    html += "let timeLeft = " + String(secondsLeft) + ";";
-    html += "let countdown = setInterval(function() {";
-    html += "  timeLeft--;";
-    html += "  if (timeLeft <= 0) {";
-    html += "    clearInterval(countdown);";
-    html += "    document.getElementById('timerText').innerHTML = '<strong>Powered ON!</strong>';";
-    html += "    setTimeout(function() { location.reload(); }, 1500);"; // Reload page to sync the button state
-    html += "  } else {";
-    html += "    document.getElementById('timer').innerText = timeLeft;";
-    html += "  }";
-    html += "}, 1000);";
-    html += "</script>";
-  } else {
-    html += "<p>Startup timer: <strong>Completed</strong></p>";
-  }
-
-  // Change the button text and color depending on the current state
-  if (relayState) {
-    html += "<p>Relay is currently: <strong>ON</strong></p>";
-    html += "<a href=\"/toggle\" class=\"btn btn-on\">Turn OFF</a>";
-  } else {
-    html += "<p>Relay is currently: <strong>OFF</strong></p>";
-    html += "<a href=\"/toggle\" class=\"btn btn-off\">Turn ON</a>";
-  }
-  
-  html += "</body></html>";
-  return html;
+  setTimeout(pollStatus, 1000);
+}
+for (const id of ['toggleForm', 'timerForm']) {
+  const form = document.getElementById(id);
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      const response = await fetch(form.action, {
+        method: 'POST', body: new URLSearchParams(new FormData(form))
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshStatus();
+      document.getElementById('error').textContent = '';
+    } catch (error) {
+      document.getElementById('error').textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+pollStatus();
+</script></body></html>)HTML");
 }
 
-// What happens when someone goes to the main page (http://<IP_ADDRESS>/)
-void handleRoot() {
-  server.send(200, "text/html", getHTML());
+void redirectHome() {
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
 }
 
-// What happens when someone clicks the button (http://<IP_ADDRESS>/toggle)
 void handleToggle() {
-  relayState = !relayState; // Flip the state variable
-  
-  // NOTE: Most ESP-01S relay boards are "Active-LOW". 
-  // This means sending a LOW signal turns the relay ON, and HIGH turns it OFF.
-  if (relayState) {
-    digitalWrite(RELAY_PIN, LOW);  // Turn Relay ON
-    Serial.println("Relay toggled: ON");
-  } else {
-    digitalWrite(RELAY_PIN, HIGH); // Turn Relay OFF
-    Serial.println("Relay toggled: OFF");
+  timerActive = false;
+  setRelay(!relayState);
+  redirectHome();
+}
+
+void handleStartTimer() {
+  const String input = server.arg("seconds");
+  unsigned long seconds = 0;
+  bool valid = input.length() > 0;
+  for (unsigned int i = 0; valid && i < input.length(); ++i) {
+    const char digit = input[i];
+    if (digit < '0' || digit > '9') {
+      valid = false;
+      break;
+    }
+    const unsigned long value = digit - '0';
+    if (seconds > (MAX_TIMER_SECONDS - value) / 10UL) {
+      valid = false;
+      break;
+    }
+    seconds = seconds * 10UL + value;
   }
-  
-  // After toggling, redirect the browser back to the main page
-  server.sendHeader("Location", String("/"), true);
-  server.send(302, "text/plain", "");
+  if (!valid || seconds == 0) {
+    server.send(400, "text/plain", "Enter a whole number of seconds from 1 to 4294967.");
+    return;
+  }
+  setRelay(false);
+  timerStartedAt = millis();
+  timerDuration = seconds * 1000UL;
+  timerActive = true;
+  Serial.printf("Relay timer started: %lu seconds\n", seconds);
+  redirectHome();
+}
+
+void handleStatus() {
+  updateTimer();
+  String json = F("{\"on\":");
+  json += relayState ? "true" : "false";
+  json += F(",\"active\":");
+  json += timerActive ? "true" : "false";
+  json += F(",\"remaining\":");
+  json += String(secondsRemaining());
+  json += '}';
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void updateWifiAndLed() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  const unsigned long now = millis();
+  if (connected != wifiWasConnected) {
+    wifiWasConnected = connected;
+    ledOn = true;
+    lastLedChange = now;
+    if (connected) {
+      Serial.print("Wi-Fi connected. Open http://");
+      Serial.println(WiFi.localIP());
+      mdnsStarted = MDNS.begin("esp-relay");
+      if (mdnsStarted) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("Also available at http://esp-relay.local");
+      }
+    } else {
+      if (mdnsStarted) MDNS.close();
+      mdnsStarted = false;
+      Serial.println("Wi-Fi disconnected. Reconnecting...");
+    }
+  }
+  if (connected) {
+    ledOn = true;
+  } else if (now - lastLedChange >= LED_BLINK_INTERVAL) {
+    ledOn = !ledOn;
+    lastLedChange = now;
+  }
+  digitalWrite(STATUS_LED_PIN, ledOn ? LOW : HIGH);
+  if (mdnsStarted) MDNS.update();
 }
 
 void setup() {
-  // Start the serial port for debugging
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("\nStarting up...");
-  
-  // Set up the relay pin
+  // Set output levels before enabling the pins to avoid a relay activation glitch.
+  digitalWrite(RELAY_PIN, HIGH);
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH); // Ensure it starts in the OFF state
-  
-  // Connect to Wi-Fi
+  digitalWrite(STATUS_LED_PIN, LOW);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  lastLedChange = millis();
+
+  Serial.begin(115200);
+  Serial.println("\nStarting up...");
+
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", getHTML()); });
+  server.on("/toggle", HTTP_POST, handleToggle);
+  server.on("/timer", HTTP_POST, handleStartTimer);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.begin();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi: ");
   Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  
-  // Wait until connected
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  Serial.println("\nWi-Fi Connected!");
-  Serial.print("Go to this IP Address in your browser: ");
-  Serial.println(WiFi.localIP()); // Print the IP address to the Serial Monitor
-  
-  // Tell the web server which functions to run for different URLs
-  server.on("/", handleRoot);
-  server.on("/toggle", handleToggle);
-  
-  // Start listening for web traffic
-  server.begin();
-  Serial.println("Web server running.");
-  
-  // Start mDNS so you can access the ESP at http://esp-relay.local
-  if (MDNS.begin("esp-relay")) {
-    Serial.println("MDNS responder started. Go to http://esp-relay.local");
-  }
+  // Connection is handled in loop(), so the timer and LED keep working offline.
 }
 
 void loop() {
-  MDNS.update(); // Required to keep mDNS running smoothly
-  // Check for incoming web clients constantly
+  updateTimer();
+  updateWifiAndLed();
   server.handleClient();
-
-  // Check if 60 seconds have passed since boot and we haven't auto-turned on yet
-  if (!autoTurnedOn && millis() >= AUTO_TURN_ON_DELAY) {
-    autoTurnedOn = true; // Mark as triggered so it only happens once
-    if (!relayState) {   // Only turn on if it's currently off
-      relayState = true;
-      digitalWrite(RELAY_PIN, LOW); // Turn Relay ON (Active-LOW)
-      Serial.println("Relay automatically toggled: ON (60 seconds after boot)");
-    }
-  }
 }
