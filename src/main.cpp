@@ -11,7 +11,7 @@ const char* password = "PASSWORD";
 // Web login credentials (separate from the Wi-Fi password).
 const char WEB_USERNAME[] = "admin";
 // Set this before compiling. A password saved through Config overrides it.
-const char DEFAULT_WEB_PASSWORD[] = "ChangeMe123!";
+const char DEFAULT_WEB_PASSWORD[] = "ChangeMe!";
 static_assert(sizeof(DEFAULT_WEB_PASSWORD) >= 9 && sizeof(DEFAULT_WEB_PASSWORD) <= 129,
               "Web password must be 8-128 bytes");
 const size_t MAX_WEB_PASSWORD_LENGTH = 128;
@@ -24,14 +24,15 @@ const int RELAY_PIN = 0;
 // ESP-01S onboard LED: GPIO2, active LOW (do not use the relay pin).
 const int STATUS_LED_PIN = 2;
 static_assert(RELAY_PIN != STATUS_LED_PIN, "Relay and LED need separate pins");
-const unsigned long AUTO_TURN_ON_DELAY = 60000UL;
+const unsigned long DEFAULT_STARTUP_DELAY_SECONDS = 60UL;
 const unsigned long LED_BLINK_INTERVAL = 1000UL;
 const unsigned long MAX_TIMER_SECONDS = 4294967UL; // Fits in 32-bit milliseconds.
 
 bool relayState = false;
 bool timerActive = true;
 unsigned long timerStartedAt = 0; // Startup countdown begins at boot.
-unsigned long timerDuration = AUTO_TURN_ON_DELAY;
+unsigned long startupDelaySeconds = DEFAULT_STARTUP_DELAY_SECONDS;
+unsigned long timerDuration = DEFAULT_STARTUP_DELAY_SECONDS * 1000UL;
 bool ledOn = true;
 unsigned long lastLedChange = 0;
 bool wifiWasConnected = false;
@@ -42,7 +43,8 @@ ESP8266WebServer server(80);
 const size_t MAX_DISPLAY_NAME_LENGTH = 64;
 const size_t MAX_MDNS_NAME_LENGTH = 63;
 const uint32_t LEGACY_SETTINGS_MAGIC = 0x524C5901;
-const uint32_t SETTINGS_MAGIC = 0x524C5902; // Version 2 adds a password override.
+const uint32_t PASSWORD_SETTINGS_MAGIC = 0x524C5902;
+const uint32_t SETTINGS_MAGIC = 0x524C5903; // Version 3 adds the startup delay.
 struct LegacyDeviceSettings {
   uint32_t magic;
   uint32_t checksum;
@@ -53,6 +55,14 @@ struct PasswordCredentials {
   uint8_t salt[16];
   uint8_t hash[32];
 };
+struct PasswordDeviceSettings {
+  uint32_t magic;
+  uint32_t checksum;
+  char displayName[MAX_DISPLAY_NAME_LENGTH + 1];
+  char mdnsName[MAX_MDNS_NAME_LENGTH + 1];
+  uint8_t hasPasswordOverride;
+  PasswordCredentials credentials;
+};
 struct DeviceSettings {
   uint32_t magic;
   uint32_t checksum;
@@ -60,6 +70,7 @@ struct DeviceSettings {
   char mdnsName[MAX_MDNS_NAME_LENGTH + 1];
   uint8_t hasPasswordOverride;
   PasswordCredentials credentials;
+  uint32_t startupDelaySeconds;
 };
 String displayName = "ESP-01S Relay Controller";
 String mdnsName = "esp-relay";
@@ -151,11 +162,20 @@ uint32_t namesChecksum(const T& settings) {
   return hash;
 }
 
-uint32_t settingsChecksum(const DeviceSettings& settings) {
+template <typename T>
+uint32_t passwordSettingsChecksum(const T& settings) {
   uint32_t hash = namesChecksum(settings);
   hash = (hash ^ settings.hasPasswordOverride) * 16777619UL;
   for (uint8_t c : settings.credentials.salt) hash = (hash ^ c) * 16777619UL;
   for (uint8_t c : settings.credentials.hash) hash = (hash ^ c) * 16777619UL;
+  return hash;
+}
+
+uint32_t settingsChecksum(const DeviceSettings& settings) {
+  uint32_t hash = passwordSettingsChecksum(settings);
+  for (unsigned int shift = 0; shift < 32; shift += 8) {
+    hash = (hash ^ ((settings.startupDelaySeconds >> shift) & 0xff)) * 16777619UL;
+  }
   return hash;
 }
 
@@ -171,13 +191,27 @@ void loadSettings() {
   DeviceSettings saved = {};
   EEPROM.get(0, saved);
   if (saved.magic == SETTINGS_MAGIC && saved.checksum == settingsChecksum(saved) &&
-      saved.hasPasswordOverride <= 1 && validStoredNames(saved)) {
+      saved.hasPasswordOverride <= 1 && validStoredNames(saved) &&
+      saved.startupDelaySeconds >= 1 && saved.startupDelaySeconds <= MAX_TIMER_SECONDS) {
     displayName = saved.displayName;
     mdnsName = saved.mdnsName;
     hasPasswordOverride = saved.hasPasswordOverride != 0;
     passwordCredentials = saved.credentials;
+    startupDelaySeconds = saved.startupDelaySeconds;
     settingsPersisted = true;
   } else {
+    PasswordDeviceSettings previous = {};
+    EEPROM.get(0, previous);
+    if (previous.magic == PASSWORD_SETTINGS_MAGIC &&
+        previous.checksum == passwordSettingsChecksum(previous) &&
+        previous.hasPasswordOverride <= 1 && validStoredNames(previous)) {
+      displayName = previous.displayName;
+      mdnsName = previous.mdnsName;
+      hasPasswordOverride = previous.hasPasswordOverride != 0;
+      passwordCredentials = previous.credentials;
+      Serial.println("Loaded previous configuration. Startup delay defaults to 60 seconds.");
+      return;
+    }
     // Keep names saved by the previous firmware; use the compiled login password.
     LegacyDeviceSettings legacy = {};
     EEPROM.get(0, legacy);
@@ -193,15 +227,18 @@ void loadSettings() {
 }
 
 bool saveSettings(const String& newDisplayName, const String& newMdnsName,
+                  unsigned long newStartupDelaySeconds,
                   const PasswordCredentials* newCredentials = nullptr) {
   // Write only on a changed Save, never during polling or at each boot.
-  if (!newCredentials && settingsPersisted && newDisplayName == displayName && newMdnsName == mdnsName) return true;
+  if (!newCredentials && settingsPersisted && newDisplayName == displayName &&
+      newMdnsName == mdnsName && newStartupDelaySeconds == startupDelaySeconds) return true;
   DeviceSettings saved = {};
   saved.magic = SETTINGS_MAGIC;
   newDisplayName.toCharArray(saved.displayName, sizeof(saved.displayName));
   newMdnsName.toCharArray(saved.mdnsName, sizeof(saved.mdnsName));
   saved.hasPasswordOverride = newCredentials || hasPasswordOverride;
   saved.credentials = newCredentials ? *newCredentials : passwordCredentials;
+  saved.startupDelaySeconds = newStartupDelaySeconds;
   saved.checksum = settingsChecksum(saved);
   EEPROM.put(0, saved);
   if (!EEPROM.commit()) return false;
@@ -209,6 +246,7 @@ bool saveSettings(const String& newDisplayName, const String& newMdnsName,
   mdnsName = newMdnsName;
   hasPasswordOverride = saved.hasPasswordOverride != 0;
   passwordCredentials = saved.credentials;
+  startupDelaySeconds = saved.startupDelaySeconds;
   settingsPersisted = true;
   return true;
 }
@@ -501,7 +539,8 @@ pollStatus();
 }
 
 String getConfigHTML(const String& message, bool isError,
-                     const String& formDisplayName, const String& formMdnsName) {
+                     const String& formDisplayName, const String& formMdnsName,
+                     const String& formStartupDelay) {
   String html;
   html.reserve(3000);
   html = F("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Config - ");
@@ -525,7 +564,10 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
   html += escapeHtml(formDisplayName);
   html += F("\"><p class=\"help\">Up to 64 bytes; spaces are allowed.</p><label for=\"mdnsName\">mDNS hostname</label><input id=\"mdnsName\" name=\"mdnsName\" type=\"text\" maxlength=\"63\" pattern=\"[A-Za-z0-9]([A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?\" autocapitalize=\"none\" spellcheck=\"false\" required value=\"");
   html += escapeHtml(formMdnsName);
-  html += F("\"><p class=\"help\">Use letters, digits and hyphens. Enter only the hostname, without .local; for example, garage-relay. Choose a unique name on your network.</p><button type=\"submit\">Save</button></form><p>Settings are retained after reboot or power loss.</p>");
+  html += F("\"><p class=\"help\">Use letters, digits and hyphens. Enter only the hostname, without .local; for example, garage-relay. Choose a unique name on your network.</p>");
+  html += F("<label for=\"startupDelaySeconds\">Startup delay (seconds)</label><input id=\"startupDelaySeconds\" name=\"startupDelaySeconds\" type=\"number\" min=\"1\" max=\"4294967\" step=\"1\" required value=\"");
+  html += escapeHtml(formStartupDelay);
+  html += F("\"><p class=\"help\">Time before the relay turns ON after boot. Default: 60 seconds. Changes apply on the next reboot.</p><button type=\"submit\">Save</button></form><p>Settings are retained after reboot or power loss.</p>");
   html += F("<h3>Change admin password</h3><form action=\"/password\" method=\"post\">");
   html += csrfInput();
   html += F(R"HTML(<label for="currentPassword">Current password</label>
@@ -548,12 +590,27 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
 
 void handleConfig() {
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html; charset=utf-8", getConfigHTML("", false, displayName, mdnsName));
+  server.send(200, "text/html; charset=utf-8", getConfigHTML("", false, displayName, mdnsName, String(startupDelaySeconds)));
+}
+
+bool parseTimerSeconds(const String& input, unsigned long& seconds) {
+  seconds = 0;
+  if (input.length() == 0) return false;
+  for (unsigned int i = 0; i < input.length(); ++i) {
+    const char digit = input[i];
+    if (digit < '0' || digit > '9') return false;
+    const unsigned long value = digit - '0';
+    if (seconds > (MAX_TIMER_SECONDS - value) / 10UL) return false;
+    seconds = seconds * 10UL + value;
+  }
+  return seconds > 0;
 }
 
 void handleSaveConfig() {
   String newDisplayName = server.arg("displayName");
   String newMdnsName = server.arg("mdnsName");
+  const String newStartupDelay = server.arg("startupDelaySeconds");
+  unsigned long newStartupDelaySeconds = 0;
   newDisplayName.trim();
   newMdnsName.trim();
   newMdnsName.toLowerCase();
@@ -561,20 +618,26 @@ void handleSaveConfig() {
   if (!validDisplayName(newDisplayName) || !validMdnsName(newMdnsName)) {
     server.send(400, "text/html; charset=utf-8", getConfigHTML(
       "Enter a display name of 1-64 bytes and a hostname of 1-63 letters, digits or hyphens. The hostname cannot start or end with a hyphen or contain .local.",
-      true, newDisplayName, newMdnsName));
+      true, newDisplayName, newMdnsName, newStartupDelay));
+    return;
+  }
+  if (!parseTimerSeconds(newStartupDelay, newStartupDelaySeconds)) {
+    server.send(400, "text/html; charset=utf-8", getConfigHTML(
+      "Enter a startup delay in whole seconds from 1 to 4294967.",
+      true, newDisplayName, newMdnsName, newStartupDelay));
     return;
   }
   const bool hostnameChanged = newMdnsName != mdnsName;
-  if (!saveSettings(newDisplayName, newMdnsName)) {
+  if (!saveSettings(newDisplayName, newMdnsName, newStartupDelaySeconds)) {
     server.send(500, "text/html; charset=utf-8", getConfigHTML(
-      "Could not save settings to flash. Please try again.", true, newDisplayName, newMdnsName));
+      "Could not save settings to flash. Please try again.", true, newDisplayName, newMdnsName, newStartupDelay));
     return;
   }
   if (hostnameChanged || !mdnsStarted) restartMdns();
   const String message = mdnsStarted
-    ? "Settings saved. The display name and mDNS address are updated; no reboot is needed."
-    : "Settings saved, but mDNS is unavailable right now. Use Back to relay to connect by IP address.";
-  server.send(200, "text/html; charset=utf-8", getConfigHTML(message, false, displayName, mdnsName));
+    ? "Settings saved. The display name and mDNS address are updated. The startup delay applies on the next reboot."
+    : "Settings saved. The startup delay applies on the next reboot. mDNS is unavailable right now; use Back to relay to connect by IP address.";
+  server.send(200, "text/html; charset=utf-8", getConfigHTML(message, false, displayName, mdnsName, String(startupDelaySeconds)));
 }
 
 void handleChangePassword() {
@@ -584,29 +647,29 @@ void handleChangePassword() {
   if (newPassword.length() < 8 || newPassword.length() > MAX_WEB_PASSWORD_LENGTH ||
       !secretEquals(newPassword, confirmation)) {
     server.send(400, "text/html; charset=utf-8", getConfigHTML(
-      "The new password must contain 8-128 bytes and match its confirmation.", true, displayName, mdnsName));
+      "The new password must contain 8-128 bytes and match its confirmation.", true, displayName, mdnsName, String(startupDelaySeconds)));
     return;
   }
   const unsigned long now = millis();
   if (loginAttemptMade && now - lastLoginAttempt < LOGIN_RETRY_DELAY) {
     server.sendHeader("Retry-After", "1");
     server.send(429, "text/html; charset=utf-8", getConfigHTML(
-      "Please wait a second before trying again.", true, displayName, mdnsName));
+      "Please wait a second before trying again.", true, displayName, mdnsName, String(startupDelaySeconds)));
     return;
   }
   loginAttemptMade = true;
   lastLoginAttempt = now;
   if (!verifyWebPassword(currentPassword)) {
     server.send(403, "text/html; charset=utf-8", getConfigHTML(
-      "The current password is incorrect.", true, displayName, mdnsName));
+      "The current password is incorrect.", true, displayName, mdnsName, String(startupDelaySeconds)));
     return;
   }
   PasswordCredentials updated = {};
   ESP.random(updated.salt, sizeof(updated.salt));
   derivePasswordHash(newPassword, updated.salt, updated.hash);
-  if (!saveSettings(displayName, mdnsName, &updated)) {
+  if (!saveSettings(displayName, mdnsName, startupDelaySeconds, &updated)) {
     server.send(500, "text/html; charset=utf-8", getConfigHTML(
-      "Could not save the password to flash. Please try again.", true, displayName, mdnsName));
+      "Could not save the password to flash. Please try again.", true, displayName, mdnsName, String(startupDelaySeconds)));
     return;
   }
   for (WebSession& session : sessions) session.token[0] = '\0';
@@ -625,23 +688,8 @@ void handleToggle() {
 }
 
 void handleStartTimer() {
-  const String input = server.arg("seconds");
   unsigned long seconds = 0;
-  bool valid = input.length() > 0;
-  for (unsigned int i = 0; valid && i < input.length(); ++i) {
-    const char digit = input[i];
-    if (digit < '0' || digit > '9') {
-      valid = false;
-      break;
-    }
-    const unsigned long value = digit - '0';
-    if (seconds > (MAX_TIMER_SECONDS - value) / 10UL) {
-      valid = false;
-      break;
-    }
-    seconds = seconds * 10UL + value;
-  }
-  if (!valid || seconds == 0) {
+  if (!parseTimerSeconds(server.arg("seconds"), seconds)) {
     server.send(400, "text/plain", "Enter a whole number of seconds from 1 to 4294967.");
     return;
   }
@@ -704,6 +752,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\nStarting up...");
   loadSettings();
+  timerDuration = startupDelaySeconds * 1000UL;
 
   server.collectHeaders("Cookie");
   server.on("/login", HTTP_GET, handleLogin);
