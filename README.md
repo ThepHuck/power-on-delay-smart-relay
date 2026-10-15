@@ -1,4 +1,4 @@
-# ESP-01S relay controller
+# ESP-01S/ESP8266 relay controller
 
 ## Wi-Fi setup
 
