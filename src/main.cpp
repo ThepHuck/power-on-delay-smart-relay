@@ -2,11 +2,35 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <EEPROM.h>
+#include <DNSServer.h>
 #include <bearssl/bearssl_hmac.h>
 
-// --- UPDATE THESE WITH YOUR WI-FI DETAILS ---
-const char* ssid = "SSID";
-const char* password = "PASSWORD";
+// Wi-Fi credentials are entered through the setup hotspot, never compiled in.
+const char SETUP_AP_PASSWORD[] = "RelaySetup!";
+const unsigned long WIFI_CONNECT_TIMEOUT = 30000UL;
+const size_t WIFI_SETTINGS_OFFSET = 512; // Leave existing device settings intact.
+const uint32_t WIFI_SETTINGS_MAGIC = 0x57494601;
+struct WifiSettings {
+  uint32_t magic;
+  uint32_t checksum;
+  char ssid[33];
+  char password[65];
+};
+String wifiSsid;
+String wifiPassword;
+String setupApName;
+String wifiMessage;
+char setupToken[33] = {};
+DNSServer dnsServer;
+bool setupApActive = false;
+bool wifiAttemptPending = false;
+bool testingWifi = false;
+bool wifiSaveFailed = false;
+unsigned long wifiAttemptQueuedAt = 0;
+unsigned long wifiDisconnectedAt = 0;
+unsigned long setupConnectedAt = 0;
+String candidateSsid;
+String candidatePassword;
 
 // Web login credentials (separate from the Wi-Fi password).
 const char WEB_USERNAME[] = "admin";
@@ -72,6 +96,7 @@ struct DeviceSettings {
   PasswordCredentials credentials;
   uint32_t startupDelaySeconds;
 };
+static_assert(sizeof(DeviceSettings) <= WIFI_SETTINGS_OFFSET, "Settings overlap Wi-Fi storage");
 String displayName = "ESP-01S Relay Controller";
 String mdnsName = "esp-relay";
 bool settingsPersisted = false;
@@ -187,7 +212,7 @@ bool validStoredNames(const T& saved) {
 }
 
 void loadSettings() {
-  EEPROM.begin(sizeof(DeviceSettings));
+  EEPROM.begin(WIFI_SETTINGS_OFFSET + sizeof(WifiSettings));
   DeviceSettings saved = {};
   EEPROM.get(0, saved);
   if (saved.magic == SETTINGS_MAGIC && saved.checksum == settingsChecksum(saved) &&
@@ -390,6 +415,11 @@ String csrfInput() {
 void addProtectedRoute(const char* uri, HTTPMethod method, std::function<void()> handler) {
   server.on(uri, method, [method, handler]() {
     sendPrivateHeaders();
+    if (setupApActive && server.client().localIP() == WiFi.softAPIP() &&
+        method == HTTP_GET && server.uri() == "/") {
+      redirectTo("/wifi");
+      return;
+    }
     WebSession* session = authenticatedSession();
     if (!session) {
       clearSessionCookie();
@@ -577,7 +607,7 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
 <label for="confirmPassword">Confirm new password</label>
 <input id="confirmPassword" name="confirmPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
 <p class="help">Use 8-128 bytes. Changing the password signs out all sessions.</p>
-<button type="submit">Update password</button></form><p>Device address: <a href="http://)HTML");
+<button type="submit">Update password</button></form><p><a href="/wifi">Configure Wi-Fi</a></p><p>Device address: <a href="http://)HTML");
   html += mdnsName;
   html += F(".local/\">http://");
   html += mdnsName;
@@ -714,6 +744,184 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
+uint32_t wifiChecksum(const WifiSettings& saved) {
+  uint32_t hash = 2166136261UL;
+  for (char c : saved.ssid) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
+  for (char c : saved.password) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
+  return hash;
+}
+
+bool validWifiCredentials(const String& ssid, const String& password) {
+  if (ssid.length() == 0 || ssid.length() > 32) return false;
+  if (password.length() == 0) return true; // Open network.
+  if (password.length() == 64) {
+    for (unsigned int i = 0; i < password.length(); ++i) {
+      const char c = password[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+  }
+  if (password.length() < 8 || password.length() > 63) return false;
+  for (unsigned int i = 0; i < password.length(); ++i) {
+    if (password[i] < 32 || password[i] > 126) return false;
+  }
+  return true;
+}
+
+void loadWifiSettings() {
+  WifiSettings saved = {};
+  EEPROM.get(WIFI_SETTINGS_OFFSET, saved);
+  if (saved.magic != WIFI_SETTINGS_MAGIC || saved.checksum != wifiChecksum(saved) ||
+      !memchr(saved.ssid, '\0', sizeof(saved.ssid)) ||
+      !memchr(saved.password, '\0', sizeof(saved.password)) ||
+      !validWifiCredentials(String(saved.ssid), String(saved.password))) return;
+  wifiSsid = saved.ssid;
+  wifiPassword = saved.password;
+}
+
+bool saveWifiSettings() {
+  WifiSettings saved = {};
+  saved.magic = WIFI_SETTINGS_MAGIC;
+  candidateSsid.toCharArray(saved.ssid, sizeof(saved.ssid));
+  candidatePassword.toCharArray(saved.password, sizeof(saved.password));
+  saved.checksum = wifiChecksum(saved);
+  // Restore the RAM buffer on failure so another settings save cannot persist it.
+  WifiSettings previous = {};
+  EEPROM.get(WIFI_SETTINGS_OFFSET, previous);
+  EEPROM.put(WIFI_SETTINGS_OFFSET, saved);
+  if (!EEPROM.commit()) {
+    EEPROM.put(WIFI_SETTINGS_OFFSET, previous);
+    return false;
+  }
+  wifiSsid = candidateSsid;
+  wifiPassword = candidatePassword;
+  return true;
+}
+
+void startSetupAp() {
+  if (setupApActive) return;
+  WiFi.mode(WIFI_AP_STA);
+  const IPAddress address(192, 168, 4, 1);
+  WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0));
+  if (!WiFi.softAP(setupApName.c_str(), SETUP_AP_PASSWORD)) {
+    Serial.println("Could not start Wi-Fi setup hotspot.");
+    return;
+  }
+  setupApActive = true;
+  setupConnectedAt = millis();
+  dnsServer.start(53, "*", address);
+  Serial.printf("Wi-Fi setup: join %s with password %s, then open http://192.168.4.1\n",
+                setupApName.c_str(), SETUP_AP_PASSWORD);
+}
+
+void handleWifiSetup() {
+  sendPrivateHeaders();
+  const bool fromHotspot = setupApActive && server.client().localIP() == WiFi.softAPIP();
+  WebSession* session = fromHotspot ? nullptr : authenticatedSession();
+  if (!fromHotspot && !session) {
+    redirectTo("/login");
+    return;
+  }
+  const String token = fromHotspot ? String(setupToken) : String(session->csrf);
+  if (server.method() == HTTP_POST) {
+    if (!secretEquals(server.arg("csrf"), token)) {
+      server.send(403, "text/plain", "Reload the setup page and try again.");
+      return;
+    }
+    if (testingWifi || wifiAttemptPending) {
+      server.send(409, "text/plain", "A connection attempt is already running. Reload in 30 seconds.");
+      return;
+    }
+    const String ssid = server.arg("ssid");
+    const String password = server.arg("wifiPassword");
+    if (!validWifiCredentials(ssid, password)) {
+      server.send(400, "text/plain", "Use an SSID of 1-32 bytes and a password of 8-63 printable characters (or 64 hex digits). Leave the password empty for an open network.");
+      return;
+    }
+    candidateSsid = ssid; // Preserve spaces in both network name and password.
+    candidatePassword = password;
+    wifiSaveFailed = false;
+    startSetupAp(); // Keep recovery available even when changing Wi-Fi from the LAN.
+    if (!setupApActive) {
+      candidatePassword = "";
+      server.send(503, "text/plain", "Setup hotspot could not start. Please try again.");
+      return;
+    }
+    wifiMessage = "Connecting... This can take 30 seconds. If disconnected, join " +
+      setupApName + " and open http://192.168.4.1 to check the result.";
+    wifiAttemptQueuedAt = millis();
+    wifiAttemptPending = true;
+  }
+  String html = F(R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Wi-Fi setup</title>
+<style>body{font-family:Arial,sans-serif;max-width:440px;margin:40px auto;padding:0 16px;background:#f4f4f4}
+label{display:block;margin-top:20px}input,button{box-sizing:border-box;width:100%;padding:12px;font-size:18px;margin-top:8px}
+button{background:#1976d2;color:white;border:0;border-radius:8px}</style></head><body>
+<h2>Wi-Fi setup</h2><p>Enter your 2.4 GHz Wi-Fi network. Credentials are saved after a successful connection.</p><p>)HTML");
+  html += escapeHtml(wifiMessage);
+  html += F("</p>");
+  if (!testingWifi && !wifiAttemptPending && WiFi.status() == WL_CONNECTED) {
+    html += F("<p>Connected. Join your home Wi-Fi, then open <a href=\"http://");
+    html += WiFi.localIP().toString();
+    html += F("/\">http://");
+    html += WiFi.localIP().toString();
+    html += F("/</a>. The setup hotspot closes shortly.</p>");
+  }
+  html += F("<form action=\"/wifi\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+  html += token;
+  html += F("\"><label for=\"ssid\">Wi-Fi SSID</label><input id=\"ssid\" name=\"ssid\" maxlength=\"32\" autocapitalize=\"none\" spellcheck=\"false\" required value=\"");
+  html += escapeHtml(wifiSsid);
+  html += F(R"HTML("><label for="wifiPassword">Wi-Fi password</label>
+<input id="wifiPassword" name="wifiPassword" type="password" maxlength="64" autocomplete="new-password">
+<p>Leave empty only for an open network.</p><button type="submit">Connect and save</button></form>
+<p><a href="/wifi">Refresh connection status</a></p></body></html>)HTML");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void updateWifiSetup() {
+  const unsigned long now = millis();
+  if (wifiAttemptPending && now - wifiAttemptQueuedAt >= 500UL) {
+    wifiAttemptPending = false;
+    testingWifi = true;
+    WiFi.disconnect();
+    WiFi.begin(candidateSsid.c_str(), candidatePassword.c_str());
+    wifiDisconnectedAt = now;
+  }
+  if (testingWifi) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (saveWifiSettings()) {
+        wifiMessage = "Connected! Wi-Fi settings saved.";
+        setupConnectedAt = now;
+      } else {
+        wifiSaveFailed = true;
+        wifiMessage = "Connected, but saving failed. Enter the credentials again to retry.";
+      }
+      testingWifi = false;
+      candidatePassword = "";
+    } else if (now - wifiDisconnectedAt >= WIFI_CONNECT_TIMEOUT) {
+      testingWifi = false;
+      candidatePassword = "";
+      wifiMessage = "Connection failed. Check the network name and password, then try again. Previous saved credentials are unchanged.";
+      WiFi.disconnect();
+      if (wifiSsid.length()) WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+      wifiDisconnectedAt = now;
+    }
+  }
+  if (WiFi.status() != WL_CONNECTED && now - wifiDisconnectedAt >= WIFI_CONNECT_TIMEOUT) {
+    startSetupAp();
+  }
+  if (setupApActive && !testingWifi && !wifiAttemptPending &&
+      WiFi.status() == WL_CONNECTED && !wifiSaveFailed &&
+      now - setupConnectedAt >= WIFI_CONNECT_TIMEOUT) {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    setupApActive = false;
+  }
+  if (setupApActive) dnsServer.processNextRequest();
+}
+
 void updateWifiAndLed() {
   const bool connected = WiFi.status() == WL_CONNECTED;
   const unsigned long now = millis();
@@ -722,10 +930,12 @@ void updateWifiAndLed() {
     ledOn = true;
     lastLedChange = now;
     if (connected) {
+      setupConnectedAt = now;
       Serial.print("Wi-Fi connected. Open http://");
       Serial.println(WiFi.localIP());
       restartMdns();
     } else {
+      wifiDisconnectedAt = now;
       if (mdnsStarted) MDNS.close();
       mdnsStarted = false;
       Serial.println("Wi-Fi disconnected. Reconnecting...");
@@ -752,11 +962,16 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\nStarting up...");
   loadSettings();
+  loadWifiSettings();
+  setupApName = "ESP-Relay-Setup-" + String(ESP.getChipId(), HEX);
+  randomToken(setupToken);
   timerDuration = startupDelaySeconds * 1000UL;
 
   server.collectHeaders("Cookie");
   server.on("/login", HTTP_GET, handleLogin);
   server.on("/login", HTTP_POST, handleLogin);
+  server.on("/wifi", HTTP_GET, handleWifiSetup);
+  server.on("/wifi", HTTP_POST, handleWifiSetup);
   addProtectedRoute("/", HTTP_GET, []() {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", getHTML());
@@ -768,19 +983,33 @@ void setup() {
   addProtectedRoute("/toggle", HTTP_POST, handleToggle);
   addProtectedRoute("/timer", HTTP_POST, handleStartTimer);
   addProtectedRoute("/status", HTTP_GET, handleStatus);
-  server.onNotFound([]() { server.send(404, "text/plain", "Not found."); });
+  server.onNotFound([]() {
+    if (setupApActive && server.client().localIP() == WiFi.softAPIP()) {
+      redirectTo("http://192.168.4.1/wifi");
+    } else {
+      server.send(404, "text/plain", "Not found.");
+    }
+  });
   server.begin();
 
+  WiFi.persistent(false); // EEPROM owns credentials; avoid extra SDK flash writes.
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); // Ignore credentials left in SDK storage by older firmware.
   WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(ssid);
+  wifiDisconnectedAt = millis();
+  if (wifiSsid.length()) {
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    Serial.print("Connecting to Wi-Fi: ");
+    Serial.println(wifiSsid);
+  } else {
+    startSetupAp();
+  }
   // Connection is handled in loop(), so the timer and LED keep working offline.
 }
 
 void loop() {
   updateTimer();
   updateWifiAndLed();
+  updateWifiSetup();
   server.handleClient();
 }
