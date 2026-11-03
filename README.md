@@ -79,13 +79,31 @@ Time zone rule changes require a firmware update. To refresh the bundled list,
 replace `tools/zones.csv` from that source and run
 `python tools/generate_timezones.py`, then rebuild.
 
+## Programmatic API
+
+Open **Config → API keys** to generate up to five keys, choose expiration by
+1–30 days, a local calendar date, or no expiration, and revoke keys. Expiring
+keys require NTP after each restart; no-expiration keys work offline. Existing
+Wi-Fi, device and schedule settings are preserved when installing this firmware.
+
+See [API_GUIDE.md](API_GUIDE.md) for authentication, all endpoints, expiration
+rules, error handling, and PowerShell/curl/Python examples. A reusable Python
+client is included at [examples/api_client.py](examples/api_client.py).
+
 ## Build
 
 Run `pio run` to build, or `pio run --target upload` to upload using the port
 configured in `platformio.ini` (currently COM4).
 
-The scheduler has compile-time behavioral tests, runnable without hardware:
+The scheduler and API credential policy have compile-time behavioral tests,
+runnable without hardware:
 
 ```powershell
-& "$env:USERPROFILE/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-g++.exe" -std=c++14 -Iinclude -fsyntax-only test/test_reboot_schedule.cpp test/test_schedule_storage.cpp
+& "$env:USERPROFILE/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-g++.exe" -std=c++14 -Iinclude -fsyntax-only test/test_reboot_schedule.cpp test/test_schedule_storage.cpp test/test_api_policy.cpp
+```
+
+The Python client tests run without hardware or network access:
+
+```powershell
+python -m unittest discover -s test -p test_api_client.py
 ```
