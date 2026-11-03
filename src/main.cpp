@@ -4,6 +4,7 @@
 #include <EEPROM.h>
 #include <DNSServer.h>
 #include <bearssl/bearssl_hmac.h>
+#include "schedules.h"
 
 // Wi-Fi credentials are entered through the setup hotspot, never compiled in.
 const char SETUP_AP_PASSWORD[] = "RelaySetup!";
@@ -97,6 +98,8 @@ struct DeviceSettings {
   uint32_t startupDelaySeconds;
 };
 static_assert(sizeof(DeviceSettings) <= WIFI_SETTINGS_OFFSET, "Settings overlap Wi-Fi storage");
+static_assert(WIFI_SETTINGS_OFFSET + sizeof(WifiSettings) <= SCHEDULE_SETTINGS_OFFSET,
+              "Wi-Fi settings overlap schedule storage");
 String displayName = "ESP-01S Relay Controller";
 String mdnsName = "esp-relay";
 bool settingsPersisted = false;
@@ -212,7 +215,7 @@ bool validStoredNames(const T& saved) {
 }
 
 void loadSettings() {
-  EEPROM.begin(WIFI_SETTINGS_OFFSET + sizeof(WifiSettings));
+  EEPROM.begin(SETTINGS_EEPROM_SIZE);
   DeviceSettings saved = {};
   EEPROM.get(0, saved);
   if (saved.magic == SETTINGS_MAGIC && saved.checksum == settingsChecksum(saved) &&
@@ -423,7 +426,7 @@ void addProtectedRoute(const char* uri, HTTPMethod method, std::function<void()>
     WebSession* session = authenticatedSession();
     if (!session) {
       clearSessionCookie();
-      if (method == HTTP_GET && server.uri() != "/status") redirectTo("/login");
+      if (method == HTTP_GET && server.uri() != "/status" && server.uri() != "/clock") redirectTo("/login");
       else server.send(401, "text/plain", "Authentication required.");
       return;
     }
@@ -512,7 +515,8 @@ form { margin: 24px 0; } #error { color: #b71c1c; }
 </form>
 <p>Start turns the relay OFF, then ON when the timer finishes.<br>
 Starting again replaces the timer. Manual toggling cancels it.</p>
-<p><a class="config-button" href="/config">Config</a></p>
+<p><a class="config-button" href="/config">Config</a>
+<a class="config-button" href="/schedules">Schedules</a></p>
 <form action="/logout" method="post" id="logoutForm"><button type="submit">Sign out</button></form>
 <p id="error" role="alert"></p>
 <script>
@@ -933,6 +937,7 @@ void updateWifiAndLed() {
       Serial.print("Wi-Fi connected. Open http://");
       Serial.println(WiFi.localIP());
       restartMdns();
+      syncScheduleClock();
     } else {
       wifiDisconnectedAt = now;
       if (mdnsStarted) MDNS.close();
@@ -962,6 +967,7 @@ void setup() {
   Serial.println("\nStarting up...");
   loadSettings();
   loadWifiSettings();
+  loadScheduleSettings();
   setupApName = "ESP-Relay-Setup-" + String(ESP.getChipId(), HEX);
   randomToken(setupToken);
   timerDuration = startupDelaySeconds * 1000UL;
@@ -982,6 +988,7 @@ void setup() {
   addProtectedRoute("/toggle", HTTP_POST, handleToggle);
   addProtectedRoute("/timer", HTTP_POST, handleStartTimer);
   addProtectedRoute("/status", HTTP_GET, handleStatus);
+  registerScheduleRoutes();
   server.onNotFound([]() {
     if (setupApActive && server.client().localIP() == WiFi.softAPIP()) {
       redirectTo("http://192.168.4.1/wifi");
@@ -1004,11 +1011,13 @@ void setup() {
     startSetupAp();
   }
   // Connection is handled in loop(), so the timer and LED keep working offline.
+  beginScheduleClock();
 }
 
 void loop() {
   updateTimer();
   updateWifiAndLed();
   updateWifiSetup();
+  updateSchedules();
   server.handleClient();
 }
