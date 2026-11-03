@@ -550,7 +550,9 @@ body { font-family: Arial, sans-serif; margin: 40px auto; padding: 0 16px; max-w
 label { display: block; margin-top: 24px; } input { box-sizing: border-box; width: 100%; padding: 12px; font-size: 18px; margin-top: 8px; }
 button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; color: white; background: #1976d2; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; }
 .back { background: #555; } .help { color: #555; } .error { color: #b71c1c; } .success { color: #256b2b; }
-</style></head><body><h2>Device configuration</h2><p>)HTML");
+</style></head><body><p><a class="back" href="http://)HTML");
+  html += mdnsName;
+  html += F(".local/\">&larr; Back to main page</a></p><h2>Device configuration</h2><p>");
   html += escapeHtml(displayName);
   html += F("</p>");
   if (message.length()) {
@@ -581,10 +583,7 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
   html += mdnsName;
   html += F(".local/\">http://");
   html += mdnsName;
-  html += F(".local/</a></p><p class=\"help\">After changing the hostname, open the new address above. It may take a moment to become available. Opening a different address may require signing in again.</p><p><a class=\"back\" href=\"http://");
-  // The IP link remains usable even when the page was opened through the old hostname.
-  html += WiFi.localIP().toString();
-  html += F("/\">Back to relay</a></p></body></html>");
+  html += F(".local/</a></p><p class=\"help\">After changing the hostname, open the new address above. It may take a moment to become available. Opening a different address may require signing in again.</p></body></html>");
   return html;
 }
 
@@ -636,7 +635,7 @@ void handleSaveConfig() {
   if (hostnameChanged || !mdnsStarted) restartMdns();
   const String message = mdnsStarted
     ? "Settings saved. The display name and mDNS address are updated. The startup delay applies on the next reboot."
-    : "Settings saved. The startup delay applies on the next reboot. mDNS is unavailable right now; use Back to relay to connect by IP address.";
+    : "Settings saved. The startup delay applies on the next reboot. mDNS is unavailable right now; access the device using its IP address.";
   server.send(200, "text/html; charset=utf-8", getConfigHTML(message, false, displayName, mdnsName, String(startupDelaySeconds)));
 }
 
