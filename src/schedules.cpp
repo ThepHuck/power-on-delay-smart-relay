@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include "reboot_schedule.h"
+#include "schedule_storage.h"
 #include "schedules.h"
 #include "time_zones.h"
 
@@ -21,22 +22,13 @@ extern void redirectTo(const String& location);
 extern void addProtectedRoute(const char* uri, HTTPMethod method, std::function<void()> handler);
 
 namespace {
-constexpr uint32_t SCHEDULE_SETTINGS_MAGIC = 0x53434801;
-struct ScheduleSettings {
-  uint32_t magic;
-  uint32_t checksum;
-  char ntpServer[254];
-  char timeZone[49];
-  uint8_t syncHours;
-  uint8_t count;
-  RebootSchedule entries[MAX_REBOOT_SCHEDULES];
-};
 static_assert(SCHEDULE_SETTINGS_OFFSET + sizeof(ScheduleSettings) <= SETTINGS_EEPROM_SIZE,
               "Schedule settings exceed EEPROM allocation");
 ScheduleSettings settings = {};
 int lastRunDays[MAX_REBOOT_SCHEDULES] = {};
 bool clockSynced = false;
 time_t lastCheckedSecond = 0;
+const char* const WEEKDAY_NAMES[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 
 // Read the flash table one entry at a time; never copy the database into RAM.
 bool nextTimeZone(size_t& position, String& name, String& rule) {
@@ -90,20 +82,6 @@ bool parseNumber(const String& input, unsigned int maximum, unsigned int& value)
   return true;
 }
 
-uint32_t scheduleChecksum(const ScheduleSettings& saved) {
-  uint32_t hash = 2166136261UL;
-  for (char c : saved.ntpServer) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
-  for (char c : saved.timeZone) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
-  hash = (hash ^ saved.syncHours) * 16777619UL;
-  hash = (hash ^ saved.count) * 16777619UL;
-  for (const RebootSchedule& entry : saved.entries) {
-    hash = (hash ^ entry.hour) * 16777619UL;
-    hash = (hash ^ entry.minute) * 16777619UL;
-    hash = (hash ^ entry.delaySeconds) * 16777619UL;
-  }
-  return hash;
-}
-
 bool persistSchedules(ScheduleSettings& proposed) {
   proposed.magic = SCHEDULE_SETTINGS_MAGIC;
   proposed.checksum = scheduleChecksum(proposed);
@@ -141,6 +119,17 @@ void appendOption(String& html, unsigned int value, unsigned int selected, bool 
   html += F("</option>");
 }
 
+String scheduleDaysText(const RebootSchedule& entry) {
+  if (effectiveScheduleDays(entry) == ALL_SCHEDULE_DAYS) return F("Every day");
+  String days;
+  for (uint8_t day = 0; day < 7; ++day) {
+    if (!scheduleRunsOnWeekday(entry, day)) continue;
+    if (days.length()) days += F(", ");
+    days += WEEKDAY_NAMES[day];
+  }
+  return days;
+}
+
 void sendSchedulesPage(const String& message = "", int status = 200, int edit = -1,
                        bool showNew = false) {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -156,6 +145,8 @@ button,.button{display:inline-block;padding:12px 20px;font-size:18px;color:white
 .back{background:#555}.delete{background:#b71c1c}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.actions form{margin:0}
 article{padding:16px;background:white;border-radius:8px;margin:16px 0}section{margin:28px 0}.help{color:#555}
 #local-time{font-weight:bold;overflow-wrap:anywhere}.error{color:#b71c1c}
+fieldset{margin-top:20px;border:1px solid #aaa;border-radius:8px}.weekdays{display:flex;flex-wrap:wrap;gap:12px}
+.weekdays label{display:inline-flex;align-items:center;gap:6px;margin:4px 0}.weekdays input{width:auto;margin:0;padding:0}
 </style></head><body><h2>Schedules</h2><p>)HTML");
   html += escapeHtml(displayName);
   html += F("</p>");
@@ -191,12 +182,14 @@ article{padding:16px;background:white;border-radius:8px;margin:16px 0}section{ma
   }
   html += F("</select><p class=\"help\">Save to apply the selected time zone. Daylight saving time follows the selected zone's rules.</p><p>The ESP8266 does not have a battery-backed real-time clock (RTC), and its time can drift significantly between NTP syncs. Wi-Fi and a reachable NTP server are required to sync after power loss.</p><p>Local time (saved time zone):</p><p id=\"local-time\" role=\"status\">");
   html += escapeHtml(localClockText());
-  html += F("</p><button type=\"submit\">Save</button></form></section><section><h3>Daily reboot schedules</h3><p>At each saved local time, the relay turns OFF, then ON after the selected power on delay.</p>");
+  html += F("</p><button type=\"submit\">Save</button></form></section><section><h3>Reboot schedules</h3><p>On the selected days at the saved local time, the relay turns OFF, then ON after the selected power on delay.</p>");
   server.sendContent(html);
   html = "";
   for (uint8_t i = 0; i < settings.count; ++i) {
     const RebootSchedule& entry = settings.entries[i];
-    html += F("<article><p><strong>Every day at ");
+    html += F("<article><p><strong>");
+    html += scheduleDaysText(entry);
+    html += F(" at ");
     html += twoDigits(entry.hour) + ':' + twoDigits(entry.minute);
     html += F("</strong><br>Power on delay: ");
     html += String(entry.delaySeconds);
@@ -213,7 +206,7 @@ article{padding:16px;background:white;border-radius:8px;margin:16px 0}section{ma
     yield();
   }
   if (settings.count == 0 || showNew || edit >= 0) {
-    const RebootSchedule entry = edit >= 0 ? settings.entries[edit] : RebootSchedule{0, 0, 5};
+    const RebootSchedule entry = edit >= 0 ? settings.entries[edit] : RebootSchedule{0, 0, 5, 0};
     html += F("<form id=\"scheduleForm\" action=\"/schedules/save\" method=\"post\"><h3>");
     html += edit >= 0 ? F("Edit schedule") : F("New schedule");
     html += F("</h3>");
@@ -226,7 +219,17 @@ article{padding:16px;background:white;border-radius:8px;margin:16px 0}section{ma
     for (unsigned int value = 0; value < 60; value += 5) appendOption(html, value, entry.minute, true);
     html += F("</select><label for=\"delaySeconds\">Power on delay (seconds)</label><select id=\"delaySeconds\" name=\"delaySeconds\">");
     for (uint8_t value : REBOOT_DELAYS) appendOption(html, value, entry.delaySeconds, false);
-    html += F("</select><p><button type=\"submit\">Save</button></p>");
+    html += F("</select><fieldset aria-describedby=\"days-note\"><legend>Days of week</legend><div class=\"weekdays\">");
+    for (uint8_t day = 0; day < 7; ++day) {
+      html += F("<label><input type=\"checkbox\" name=\"day");
+      html += String(day);
+      html += F("\" value=\"1\"");
+      if (entry.weekdays & (1U << day)) html += F(" checked");
+      html += '>';
+      html += WEEKDAY_NAMES[day];
+      html += F("</label>");
+    }
+    html += F("</div><p id=\"days-note\" class=\"help\">Note: Selecting ALL or NONE reboots every day.</p></fieldset><p><button type=\"submit\">Save</button></p>");
     if (settings.count) html += F("<a href=\"/schedules\">Cancel</a>");
     html += F("</form>");
   } else if (settings.count < MAX_REBOOT_SCHEDULES) {
@@ -296,21 +299,32 @@ void handleSaveSchedule() {
     sendSchedulesPage("Schedule not found, or all schedule slots are in use.", 400);
     return;
   }
+  uint8_t weekdays = 0;
+  for (uint8_t day = 0; day < 7; ++day) {
+    const String name = String(F("day")) + String(day);
+    if (!server.hasArg(name)) continue;
+    if (server.arg(name) != "1") {
+      sendSchedulesPage("Choose days using the day-of-week checkboxes.", 400, adding ? -1 : id, adding);
+      return;
+    }
+    weekdays |= 1U << day;
+  }
   if (!parseNumber(server.arg("hour"), 23, hour) ||
       !parseNumber(server.arg("minute"), 55, minute) ||
       !parseNumber(server.arg("delaySeconds"), 60, delay) ||
-      !validRebootSchedule({static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(delay)})) {
+      !validRebootSchedule({static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(delay), weekdays})) {
     sendSchedulesPage("Choose an hour from 00 to 23, a minute in 5-minute steps, and a power on delay of 5, 10, 15, 30 or 60 seconds.", 400, adding ? -1 : id, adding);
     return;
   }
+  const RebootSchedule entry = {static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(delay), weekdays};
   for (uint8_t i = 0; i < settings.count; ++i) {
-    if (i != id && settings.entries[i].hour == hour && settings.entries[i].minute == minute) {
-      sendSchedulesPage("A schedule already exists at that time. Edit that schedule or choose another time.", 409, adding ? -1 : id, adding);
+    if (i != id && rebootSchedulesOverlap(settings.entries[i], entry)) {
+      sendSchedulesPage("A schedule already exists at that time on one or more selected days. Edit that schedule or choose different days or a different time.", 409, adding ? -1 : id, adding);
       return;
     }
   }
   ScheduleSettings proposed = settings;
-  proposed.entries[id] = {static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(delay)};
+  proposed.entries[id] = entry;
   if (adding) ++proposed.count;
   if (!persistSchedules(proposed)) {
     sendSchedulesPage("Could not save the schedule to flash. Please try again.", 500, adding ? -1 : id, adding);
@@ -350,7 +364,16 @@ void loadScheduleSettings() {
   strcpy(settings.timeZone, "Etc/UTC");
   settings.syncHours = 1;
   ScheduleSettings saved = {};
-  EEPROM.get(SCHEDULE_SETTINGS_OFFSET, saved);
+  uint32_t magic = 0;
+  EEPROM.get(SCHEDULE_SETTINGS_OFFSET, magic);
+  if (magic == LEGACY_SCHEDULE_SETTINGS_MAGIC) {
+    LegacyScheduleSettings legacy = {};
+    EEPROM.get(SCHEDULE_SETTINGS_OFFSET, legacy);
+    if (legacy.checksum != scheduleChecksum(legacy)) return;
+    saved = upgradeLegacySchedules(legacy);
+  } else {
+    EEPROM.get(SCHEDULE_SETTINGS_OFFSET, saved);
+  }
   String rule;
   if (saved.magic != SCHEDULE_SETTINGS_MAGIC || saved.checksum != scheduleChecksum(saved) ||
       !memchr(saved.ntpServer, '\0', sizeof(saved.ntpServer)) ||
@@ -360,8 +383,7 @@ void loadScheduleSettings() {
   for (uint8_t i = 0; i < saved.count; ++i) {
     if (!validRebootSchedule(saved.entries[i])) return;
     for (uint8_t j = 0; j < i; ++j) {
-      if (saved.entries[i].hour == saved.entries[j].hour &&
-          saved.entries[i].minute == saved.entries[j].minute) return;
+      if (rebootSchedulesOverlap(saved.entries[i], saved.entries[j])) return;
     }
   }
   settings = saved;
@@ -399,7 +421,7 @@ void updateSchedules() {
   localtime_r(&now, &local);
   const int day = local.tm_year * 366 + local.tm_yday + 1;
   for (uint8_t i = 0; i < settings.count; ++i) {
-    if (!rebootScheduleDue(settings.entries[i], local.tm_hour, local.tm_min, day, lastRunDays[i])) continue;
+    if (!rebootScheduleDue(settings.entries[i], local.tm_hour, local.tm_min, local.tm_wday, day, lastRunDays[i])) continue;
     // Never replace an existing countdown, which could leave the load off longer.
     if (timerActive) continue;
     setRelay(false);

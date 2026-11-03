@@ -48,14 +48,21 @@ the device clock if Wi-Fi drops.
 
 The first schedule form appears automatically. Choose an hour from **00–23**,
 a minute from **00–55** in five-minute steps, and a power on delay of **5, 10,
-15, 30, or 60 seconds**, then select **Save**. The saved schedule appears with
-**Edit** and **Delete** buttons. Select **New schedule** to add another, up to
-32 daily schedules. Two entries cannot use the same time. Settings and schedules
-are retained after reboot or power loss, alongside existing device and Wi-Fi settings.
+15, 30, or 60 seconds**. Select the days of week using the checkboxes, ordered
+**Sunday through Saturday**, then select **Save**. Selecting only Monday runs
+the reboot once a week on Monday at the saved local time.
 
-Each daily schedule power cycles the relay's connected equipment: the relay
-turns OFF at the saved local time and turns ON after its delay. The controller
-stays running. An active startup/manual/scheduled power on countdown takes
+**Note: Selecting ALL or NONE reboots every day.**
+
+The saved schedule shows its days and time, with
+**Edit** and **Delete** buttons. Select **New schedule** to add another, up to
+32 schedules. Entries may share a time when their selected days do not overlap.
+Settings and schedules are retained after reboot or power loss, alongside
+existing device and Wi-Fi settings.
+
+Each schedule power cycles the relay's connected equipment: the relay
+turns OFF on its selected days at the saved local time and turns ON after its
+delay. The controller stays running. An active startup/manual/scheduled power on countdown takes
 priority; schedules due during that countdown are skipped. Manual relay controls
 retain their existing behavior and can cancel a countdown.
 
@@ -63,6 +70,8 @@ Missed times are skipped, including during boot, outages, and forward clock or
 daylight saving changes. A schedule runs at most once per local calendar day
 while the controller stays running, including when the clock moves backward.
 Editing a schedule retains that day's execution guard.
+Daily schedules saved by the earlier firmware remain daily after upgrading;
+their day checkboxes start unchecked.
 
 The dropdown includes 461 named zones, with POSIX rules bundled from
 [posix_tz_db](https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv).
@@ -78,5 +87,5 @@ configured in `platformio.ini` (currently COM4).
 The scheduler has compile-time behavioral tests, runnable without hardware:
 
 ```powershell
-& "$env:USERPROFILE/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-g++.exe" -std=c++14 -Iinclude -fsyntax-only test/test_reboot_schedule.cpp
+& "$env:USERPROFILE/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-g++.exe" -std=c++14 -Iinclude -fsyntax-only test/test_reboot_schedule.cpp test/test_schedule_storage.cpp
 ```
