@@ -279,15 +279,12 @@ void handleSaveTime() {
     sendSchedulesPage("Enter a valid NTP hostname or IPv4 address, a whole number of hours from 1 to 6, and a listed time zone.", 400);
     return;
   }
-  ScheduleSettings proposed = settings;
-  host.toCharArray(proposed.ntpServer, sizeof(proposed.ntpServer));
-  zone.toCharArray(proposed.timeZone, sizeof(proposed.timeZone));
-  proposed.syncHours = hours;
-  if (!persistSchedules(proposed)) {
-    sendSchedulesPage("Could not save time settings to flash. Please try again.", 500);
+  String error;
+  const int status = setScheduleTimeSettings(host, hours, zone, error);
+  if (status != 200) {
+    sendSchedulesPage(error, status);
     return;
   }
-  syncScheduleClock(); // Restart SNTP so a changed interval takes effect immediately.
   redirectTo("/schedules");
 }
 
@@ -317,21 +314,12 @@ void handleSaveSchedule() {
     return;
   }
   const RebootSchedule entry = {static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(delay), weekdays};
-  for (uint8_t i = 0; i < settings.count; ++i) {
-    if (i != id && rebootSchedulesOverlap(settings.entries[i], entry)) {
-      sendSchedulesPage("A schedule already exists at that time on one or more selected days. Edit that schedule or choose different days or a different time.", 409, adding ? -1 : id, adding);
-      return;
-    }
-  }
-  ScheduleSettings proposed = settings;
-  proposed.entries[id] = entry;
-  if (adding) ++proposed.count;
-  if (!persistSchedules(proposed)) {
-    sendSchedulesPage("Could not save the schedule to flash. Please try again.", 500, adding ? -1 : id, adding);
+  String error;
+  const int status = putRebootSchedule(id, entry, error);
+  if (status >= 400) {
+    sendSchedulesPage(error, status, adding ? -1 : id, adding);
     return;
   }
-  // Keep an edited schedule's daily guard, so saving it cannot repeat a power cycle.
-  if (adding) lastRunDays[id] = 0;
   redirectTo("/schedules");
 }
 
@@ -341,15 +329,12 @@ void handleDeleteSchedule() {
     sendSchedulesPage("Schedule not found.", 404);
     return;
   }
-  ScheduleSettings proposed = settings;
-  for (uint8_t i = id + 1; i < proposed.count; ++i) proposed.entries[i - 1] = proposed.entries[i];
-  proposed.entries[--proposed.count] = {};
-  if (!persistSchedules(proposed)) {
-    sendSchedulesPage("Could not delete the schedule from flash. Please try again.", 500);
+  String error;
+  const int status = removeRebootSchedule(id, error);
+  if (status != 200) {
+    sendSchedulesPage(error, status);
     return;
   }
-  for (uint8_t i = id + 1; i <= settings.count; ++i) lastRunDays[i - 1] = lastRunDays[i];
-  lastRunDays[settings.count] = 0;
   redirectTo("/schedules");
 }
 } // namespace
@@ -431,4 +416,94 @@ void updateSchedules() {
     Serial.printf("Scheduled relay reboot: %02u:%02u, power on in %u seconds\n",
                   settings.entries[i].hour, settings.entries[i].minute, settings.entries[i].delaySeconds);
   }
+}
+
+bool scheduleClockSynced() { return clockSynced; }
+const ScheduleSettings& getScheduleSettings() { return settings; }
+
+int setScheduleTimeSettings(const String& host, unsigned int hours, const String& zone, String& error) {
+  String rule;
+  if (!validNtpServer(host) || hours < 1 || hours > 6 || !findTimeZone(zone, rule)) {
+    error = "Enter a valid NTP hostname, syncHours from 1 to 6, and a listed timeZone.";
+    return 400;
+  }
+  ScheduleSettings proposed = settings;
+  memset(proposed.ntpServer, 0, sizeof(proposed.ntpServer));
+  memset(proposed.timeZone, 0, sizeof(proposed.timeZone));
+  host.toCharArray(proposed.ntpServer, sizeof(proposed.ntpServer));
+  zone.toCharArray(proposed.timeZone, sizeof(proposed.timeZone));
+  proposed.syncHours = hours;
+  if (!persistSchedules(proposed)) {
+    error = "Could not save time settings to flash.";
+    return 500;
+  }
+  syncScheduleClock();
+  return 200;
+}
+
+int putRebootSchedule(unsigned int id, const RebootSchedule& entry, String& error) {
+  if (id > settings.count || id >= MAX_REBOOT_SCHEDULES) {
+    error = "Schedule not found, or all 32 schedule slots are in use.";
+    return id >= MAX_REBOOT_SCHEDULES ? 409 : 404;
+  }
+  if (!validRebootSchedule(entry)) {
+    error = "Invalid schedule time, delay or weekdays.";
+    return 400;
+  }
+  for (uint8_t i = 0; i < settings.count; ++i) {
+    if (i != id && rebootSchedulesOverlap(settings.entries[i], entry)) {
+      error = "A schedule already exists at that time on one or more selected days.";
+      return 409;
+    }
+  }
+  const bool adding = id == settings.count;
+  ScheduleSettings proposed = settings;
+  proposed.entries[id] = entry;
+  if (adding) ++proposed.count;
+  if (!persistSchedules(proposed)) {
+    error = "Could not save the schedule to flash.";
+    return 500;
+  }
+  if (adding) lastRunDays[id] = 0;
+  return adding ? 201 : 200;
+}
+
+int removeRebootSchedule(unsigned int id, String& error) {
+  if (id >= settings.count) { error = "Schedule not found."; return 404; }
+  ScheduleSettings proposed = settings;
+  for (uint8_t i = id + 1; i < proposed.count; ++i) proposed.entries[i - 1] = proposed.entries[i];
+  proposed.entries[--proposed.count] = {};
+  if (!persistSchedules(proposed)) { error = "Could not delete the schedule from flash."; return 500; }
+  for (uint8_t i = id + 1; i <= settings.count; ++i) lastRunDays[i - 1] = lastRunDays[i];
+  lastRunDays[settings.count] = 0;
+  return 200;
+}
+
+int replaceRebootSchedules(const RebootSchedule* entries, unsigned int count, String& error) {
+  if (count > MAX_REBOOT_SCHEDULES) { error = "At most 32 schedules are allowed."; return 400; }
+  ScheduleSettings proposed = settings;
+  int nextRunDays[MAX_REBOOT_SCHEDULES] = {};
+  for (unsigned int i = 0; i < count; ++i) {
+    if (!validRebootSchedule(entries[i])) { error = "Invalid schedule time, delay or weekdays."; return 400; }
+    for (unsigned int j = 0; j < i; ++j) {
+      if (rebootSchedulesOverlap(entries[i], entries[j])) { error = "Schedule days and times overlap."; return 409; }
+    }
+    proposed.entries[i] = entries[i];
+    // Preserve today's guard when reordering or changing days/delays at an existing time.
+    for (uint8_t j = 0; j < settings.count; ++j) {
+      if (entries[i].hour == settings.entries[j].hour && entries[i].minute == settings.entries[j].minute &&
+          lastRunDays[j] > nextRunDays[i]) nextRunDays[i] = lastRunDays[j];
+    }
+  }
+  for (unsigned int i = count; i < MAX_REBOOT_SCHEDULES; ++i) proposed.entries[i] = {};
+  proposed.count = count;
+  if (!persistSchedules(proposed)) { error = "Could not save schedules to flash."; return 500; }
+  memcpy(lastRunDays, nextRunDays, sizeof(lastRunDays));
+  return 200;
+}
+
+void forEachTimeZone(const std::function<void(const String&)>& visitor) {
+  size_t position = 0;
+  String zone, rule;
+  while (nextTimeZone(position, zone, rule)) { visitor(zone); updateTimer(); yield(); }
 }
