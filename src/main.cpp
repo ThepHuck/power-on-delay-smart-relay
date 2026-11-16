@@ -3,6 +3,7 @@
 #include <ESP8266mDNS.h>
 #include <EEPROM.h>
 #include <DNSServer.h>
+#include <ArduinoJson.h>
 #include <bearssl/bearssl_hmac.h>
 #include "schedules.h"
 #include "api.h"
@@ -774,6 +775,69 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
+void applyWledState(bool on) {
+  timerActive = false;
+  setRelay(on);
+}
+
+void sendWledStatus() {
+  String json = F("{\"on\":");
+  json += relayState ? "true" : "false";
+  json += F(",\"state\":{\"on\":");
+  json += relayState ? "true" : "false";
+  json += F("},\"bri\":255}");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleWledWin() {
+  const String command = server.arg("T");
+  if (command == "1") {
+    applyWledState(true);
+  } else if (command == "0") {
+    applyWledState(false);
+  } else {
+    server.send(400, "text/plain", "WLED compatibility requires T=1 or T=0.");
+    return;
+  }
+  sendWledStatus();
+}
+
+void handleWledJson() {
+  if (server.method() == HTTP_GET) {
+    sendWledStatus();
+    return;
+  }
+
+  const String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "text/plain", "A JSON body is required for WLED compatibility requests.");
+    return;
+  }
+
+  DynamicJsonDocument document(256);
+  const DeserializationError error = deserializeJson(document, body);
+  if (error) {
+    server.send(400, "text/plain", "Invalid WLED JSON payload.");
+    return;
+  }
+
+  if (document.containsKey("on")) {
+    applyWledState(document["on"].as<bool>());
+    sendWledStatus();
+    return;
+  }
+
+  if (document.containsKey("ps")) {
+    const int preset = document["ps"].as<int>();
+    applyWledState(preset != 0);
+    sendWledStatus();
+    return;
+  }
+
+  server.send(400, "text/plain", "WLED compatibility supports on/off state or preset control.");
+}
+
 uint32_t wifiChecksum(const WifiSettings& saved) {
   uint32_t hash = 2166136261UL;
   for (char c : saved.ssid) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619UL;
@@ -1018,6 +1082,10 @@ void setup() {
   server.on("/login", HTTP_POST, handleLogin);
   server.on("/wifi", HTTP_GET, handleWifiSetup);
   server.on("/wifi", HTTP_POST, handleWifiSetup);
+  server.on("/win", HTTP_GET, handleWledWin);
+  server.on("/json", HTTP_GET, handleWledJson);
+  server.on("/json", HTTP_POST, handleWledJson);
+  server.on("/json", HTTP_PUT, handleWledJson);
   addProtectedRoute("/", HTTP_GET, []() {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", getHTML());
