@@ -5,6 +5,9 @@
 #include <DNSServer.h>
 #include <bearssl/bearssl_hmac.h>
 #include "schedules.h"
+#include "api.h"
+#include "api_keys.h"
+#include "device_services.h"
 
 // Wi-Fi credentials are entered through the setup hotspot, never compiled in.
 const char SETUP_AP_PASSWORD[] = "RelaySetup!";
@@ -21,6 +24,8 @@ String wifiSsid;
 String wifiPassword;
 String setupApName;
 String wifiMessage;
+String wifiOperationStatus = "idle";
+uint32_t wifiOperationId = 0;
 char setupToken[33] = {};
 DNSServer dnsServer;
 bool setupApActive = false;
@@ -117,6 +122,7 @@ bool loginAttemptMade = false;
 unsigned long lastLoginAttempt = 0;
 
 void updateTimer();
+void restartMdns();
 
 bool constantTimeEqual(const uint8_t* first, const uint8_t* second, size_t length) {
   uint8_t difference = 0;
@@ -268,14 +274,26 @@ bool saveSettings(const String& newDisplayName, const String& newMdnsName,
   saved.credentials = newCredentials ? *newCredentials : passwordCredentials;
   saved.startupDelaySeconds = newStartupDelaySeconds;
   saved.checksum = settingsChecksum(saved);
+  DeviceSettings previous = {};
+  EEPROM.get(0, previous);
   EEPROM.put(0, saved);
-  if (!EEPROM.commit()) return false;
+  if (!EEPROM.commit()) {
+    EEPROM.put(0, previous);
+    return false;
+  }
   displayName = newDisplayName;
   mdnsName = newMdnsName;
   hasPasswordOverride = saved.hasPasswordOverride != 0;
   passwordCredentials = saved.credentials;
   startupDelaySeconds = saved.startupDelaySeconds;
   settingsPersisted = true;
+  return true;
+}
+
+bool saveDeviceConfiguration(const String& name, const String& hostname, unsigned long delaySeconds) {
+  const bool hostnameChanged = hostname != mdnsName;
+  if (!saveSettings(name, hostname, delaySeconds)) return false;
+  if (hostnameChanged) restartMdns();
   return true;
 }
 
@@ -574,7 +592,7 @@ pollStatus();
 
 String getConfigHTML(const String& message, bool isError,
                      const String& formDisplayName, const String& formMdnsName,
-                     const String& formStartupDelay) {
+                     const String& formStartupDelay, const String& newApiKey = "") {
   String html;
   html.reserve(3000);
   html = F("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Config - ");
@@ -613,7 +631,9 @@ button, .back { display: inline-block; padding: 12px 24px; font-size: 18px; colo
 <label for="confirmPassword">Confirm new password</label>
 <input id="confirmPassword" name="confirmPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
 <p class="help">Use 8-128 bytes. Changing the password signs out all sessions.</p>
-<button type="submit">Update password</button></form><p><a href="/wifi">Configure Wi-Fi</a></p><p>Device address: <a href="http://)HTML");
+<button type="submit">Update password</button></form>)HTML");
+  html += apiKeysConfigHTML(newApiKey);
+  html += F("<p><a href=\"/wifi\">Configure Wi-Fi</a></p><p>Device address: <a href=\"http://");
   html += mdnsName;
   html += F(".local/\">http://");
   html += mdnsName;
@@ -673,39 +693,46 @@ void handleSaveConfig() {
   server.send(200, "text/html; charset=utf-8", getConfigHTML(message, false, displayName, mdnsName, String(startupDelaySeconds)));
 }
 
-void handleChangePassword() {
-  const String currentPassword = server.arg("currentPassword");
-  const String newPassword = server.arg("newPassword");
-  const String confirmation = server.arg("confirmPassword");
-  if (newPassword.length() < 8 || newPassword.length() > MAX_WEB_PASSWORD_LENGTH ||
-      !secretEquals(newPassword, confirmation)) {
-    server.send(400, "text/html; charset=utf-8", getConfigHTML(
-      "The new password must contain 8-128 bytes and match its confirmation.", true, displayName, mdnsName, String(startupDelaySeconds)));
-    return;
+int changeAdminPassword(const String& currentPassword, const String& newPassword, String& error) {
+  if (newPassword.length() < 8 || newPassword.length() > MAX_WEB_PASSWORD_LENGTH) {
+    error = "The new password must contain 8-128 bytes.";
+    return 400;
   }
   const unsigned long now = millis();
   if (loginAttemptMade && now - lastLoginAttempt < LOGIN_RETRY_DELAY) {
-    server.sendHeader("Retry-After", "1");
-    server.send(429, "text/html; charset=utf-8", getConfigHTML(
-      "Please wait a second before trying again.", true, displayName, mdnsName, String(startupDelaySeconds)));
-    return;
+    error = "Please wait a second before trying again.";
+    return 429;
   }
   loginAttemptMade = true;
   lastLoginAttempt = now;
   if (!verifyWebPassword(currentPassword)) {
-    server.send(403, "text/html; charset=utf-8", getConfigHTML(
-      "The current password is incorrect.", true, displayName, mdnsName, String(startupDelaySeconds)));
-    return;
+    error = "The current password is incorrect.";
+    return 403;
   }
   PasswordCredentials updated = {};
   ESP.random(updated.salt, sizeof(updated.salt));
   derivePasswordHash(newPassword, updated.salt, updated.hash);
   if (!saveSettings(displayName, mdnsName, startupDelaySeconds, &updated)) {
-    server.send(500, "text/html; charset=utf-8", getConfigHTML(
-      "Could not save the password to flash. Please try again.", true, displayName, mdnsName, String(startupDelaySeconds)));
-    return;
+    error = "Could not save the password to flash. Please try again.";
+    return 500;
   }
   for (WebSession& session : sessions) session.token[0] = '\0';
+  return 200;
+}
+
+void handleChangePassword() {
+  String error;
+  int status = 400;
+  if (!secretEquals(server.arg("newPassword"), server.arg("confirmPassword"))) {
+    error = "The new password must match its confirmation.";
+  } else {
+    status = changeAdminPassword(server.arg("currentPassword"), server.arg("newPassword"), error);
+  }
+  if (status != 200) {
+    if (status == 429) server.sendHeader("Retry-After", "1");
+    server.send(status, "text/html; charset=utf-8", getConfigHTML(error, true, displayName, mdnsName, String(startupDelaySeconds)));
+    return;
+  }
   clearSessionCookie();
   server.send(200, "text/html; charset=utf-8", getLoginHTML("Password updated. Sign in with your new password."));
 }
@@ -818,6 +845,32 @@ void startSetupAp() {
                 setupApName.c_str(), SETUP_AP_PASSWORD);
 }
 
+int queueWifiConfiguration(const String& ssid, const String& password, String& error) {
+  if (testingWifi || wifiAttemptPending) {
+    error = "A connection attempt is already running. Check again in 30 seconds.";
+    return 409;
+  }
+  if (!validWifiCredentials(ssid, password)) {
+    error = "Use an SSID of 1-32 bytes and an empty password for an open network, 8-63 printable characters, or 64 hex digits.";
+    return 400;
+  }
+  startSetupAp();
+  if (!setupApActive) {
+    error = "Setup hotspot could not start. Please try again.";
+    return 503;
+  }
+  candidateSsid = ssid;
+  candidatePassword = password;
+  wifiSaveFailed = false;
+  wifiMessage = "Connecting... This can take 30 seconds. If disconnected, join " +
+    setupApName + " and open http://192.168.4.1 to check the result.";
+  wifiAttemptQueuedAt = millis();
+  wifiAttemptPending = true;
+  wifiOperationStatus = "queued";
+  ++wifiOperationId;
+  return 202;
+}
+
 void handleWifiSetup() {
   sendPrivateHeaders();
   const bool fromHotspot = setupApActive && server.client().localIP() == WiFi.softAPIP();
@@ -832,29 +885,12 @@ void handleWifiSetup() {
       server.send(403, "text/plain", "Reload the setup page and try again.");
       return;
     }
-    if (testingWifi || wifiAttemptPending) {
-      server.send(409, "text/plain", "A connection attempt is already running. Reload in 30 seconds.");
+    String error;
+    const int status = queueWifiConfiguration(server.arg("ssid"), server.arg("wifiPassword"), error);
+    if (status != 202) {
+      server.send(status, "text/plain", error);
       return;
     }
-    const String ssid = server.arg("ssid");
-    const String password = server.arg("wifiPassword");
-    if (!validWifiCredentials(ssid, password)) {
-      server.send(400, "text/plain", "Use an SSID of 1-32 bytes and a password of 8-63 printable characters (or 64 hex digits). Leave the password empty for an open network.");
-      return;
-    }
-    candidateSsid = ssid; // Preserve spaces in both network name and password.
-    candidatePassword = password;
-    wifiSaveFailed = false;
-    startSetupAp(); // Keep recovery available even when changing Wi-Fi from the LAN.
-    if (!setupApActive) {
-      candidatePassword = "";
-      server.send(503, "text/plain", "Setup hotspot could not start. Please try again.");
-      return;
-    }
-    wifiMessage = "Connecting... This can take 30 seconds. If disconnected, join " +
-      setupApName + " and open http://192.168.4.1 to check the result.";
-    wifiAttemptQueuedAt = millis();
-    wifiAttemptPending = true;
   }
   String html = F(R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Wi-Fi setup</title>
@@ -887,6 +923,7 @@ void updateWifiSetup() {
   if (wifiAttemptPending && now - wifiAttemptQueuedAt >= 500UL) {
     wifiAttemptPending = false;
     testingWifi = true;
+    wifiOperationStatus = "connecting";
     WiFi.disconnect();
     WiFi.begin(candidateSsid.c_str(), candidatePassword.c_str());
     wifiDisconnectedAt = now;
@@ -895,10 +932,12 @@ void updateWifiSetup() {
     if (WiFi.status() == WL_CONNECTED) {
       if (saveWifiSettings()) {
         wifiMessage = "Connected! Wi-Fi settings saved.";
+        wifiOperationStatus = "saved";
         setupConnectedAt = now;
       } else {
         wifiSaveFailed = true;
         wifiMessage = "Connected, but saving failed. Enter the credentials again to retry.";
+        wifiOperationStatus = "save_failed";
       }
       testingWifi = false;
       candidatePassword = "";
@@ -906,6 +945,7 @@ void updateWifiSetup() {
       testingWifi = false;
       candidatePassword = "";
       wifiMessage = "Connection failed. Check the network name and password, then try again. Previous saved credentials are unchanged.";
+      wifiOperationStatus = "connection_failed";
       WiFi.disconnect();
       if (wifiSsid.length()) WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
       wifiDisconnectedAt = now;
@@ -968,6 +1008,7 @@ void setup() {
   loadSettings();
   loadWifiSettings();
   loadScheduleSettings();
+  loadApiKeys();
   setupApName = "ESP-Relay-Setup-" + String(ESP.getChipId(), HEX);
   randomToken(setupToken);
   timerDuration = startupDelaySeconds * 1000UL;
@@ -983,12 +1024,15 @@ void setup() {
   });
   addProtectedRoute("/config", HTTP_GET, handleConfig);
   addProtectedRoute("/config", HTTP_POST, handleSaveConfig);
+  addProtectedRoute("/config/api-keys", HTTP_POST, handleCreateApiKey);
+  addProtectedRoute("/config/api-keys/revoke", HTTP_POST, handleRevokeApiKey);
   addProtectedRoute("/password", HTTP_POST, handleChangePassword);
   addProtectedRoute("/logout", HTTP_POST, handleLogout);
   addProtectedRoute("/toggle", HTTP_POST, handleToggle);
   addProtectedRoute("/timer", HTTP_POST, handleStartTimer);
   addProtectedRoute("/status", HTTP_GET, handleStatus);
   registerScheduleRoutes();
+  registerApi();
   server.onNotFound([]() {
     if (setupApActive && server.client().localIP() == WiFi.softAPIP()) {
       redirectTo("http://192.168.4.1/wifi");
@@ -1019,5 +1063,6 @@ void loop() {
   updateWifiAndLed();
   updateWifiSetup();
   updateSchedules();
+  updateApiKeys();
   server.handleClient();
 }
